@@ -1,7 +1,7 @@
 from coredaq_py_api import CoreDAQ
 import time
 
-daq = CoreDAQ("/dev/tty.usbmodem2062346055301")
+daq = CoreDAQ("/dev/tty.usbmodem2062346055301") # Set your CoreDAQ port here
 
 print("Device:", daq.idn())
 
