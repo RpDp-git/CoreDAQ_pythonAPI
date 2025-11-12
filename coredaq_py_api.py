@@ -1,5 +1,5 @@
-# coredaq.py #v1.0
-# High-level driver for LumetriX CoreDAQ STM32 + AD7606 system
+# coredaq.py #v2.0 supported for Firmware v7.0 and up
+# High-level driver for CoreDAQ 
 #
 # REQUIREMENTS:
 #   pip install pyserial
@@ -133,6 +133,8 @@ class CoreDAQ:
 
             time.sleep(0.005)
 
+            
+
     # ---------- Streaming ----------
     def acq_arm(self, frames: int):
         st, p = self._ask(f"ACQ ARM {frames}")
@@ -212,6 +214,82 @@ class CoreDAQ:
 
         return ch
 
+    def i2c_refresh(self) -> None:
+        #"""Apply pending I2C changes (SHT45 read, TCA6424 writes/reads, etc.)."""
+        st, payload = self._ask("I2C REFRESH")
+        if st != "OK":
+            raise CoreDAQError(f"I2C REFRESH failed: {payload}")
+
+    def set_gain(self, head: int, value: int, apply: bool = True) -> None:
+        """
+        Queue gain change for a single head (1..4), value 0..7.
+        Automatically calls I2C REFRESH unless apply=False.
+        """
+        if head not in (1, 2, 3, 4):
+            raise ValueError("head must be 1..4")
+        if not (0 <= value <= 7):
+            raise ValueError("gain value must be 0..7")
+
+        st, payload = self._ask(f"GAIN {head} {value}")
+        if st != "OK":
+            raise CoreDAQError(f"GAIN {head} failed: {payload}")
+
+        if apply:
+            self.i2c_refresh()
+
+    def set_gains(self, g1: int | None = None, g2: int | None = None,
+                g3: int | None = None, g4: int | None = None,
+                apply: bool = True) -> None:
+        """
+        Queue multiple gains at once; only heads with non-None values are changed.
+        Automatically calls I2C REFRESH unless apply=False.
+        """
+        updates = []
+        if g1 is not None:
+            if not (0 <= g1 <= 7): raise ValueError("g1 must be 0..7")
+            updates.append(("GAIN 1", g1))
+        if g2 is not None:
+            if not (0 <= g2 <= 7): raise ValueError("g2 must be 0..7")
+            updates.append(("GAIN 2", g2))
+        if g3 is not None:
+            if not (0 <= g3 <= 7): raise ValueError("g3 must be 0..7")
+            updates.append(("GAIN 3", g3))
+        if g4 is not None:
+            if not (0 <= g4 <= 7): raise ValueError("g4 must be 0..7")
+            updates.append(("GAIN 4", g4))
+
+        for cmd, val in updates:
+            st, payload = self._ask(f"{cmd} {val}")
+            if st != "OK":
+                raise CoreDAQError(f"{cmd} failed: {payload}")
+
+        if updates and apply:
+            self.i2c_refresh()
+
+    def get_gains(self) -> tuple[int, int, int, int]:
+        """
+        Read current latched gains for all heads. Expects firmware 'GAIN?' to return
+        'HEAD1=<n> HEAD2=<n> HEAD3=<n> HEAD4=<n>'.
+        """
+        st, payload = self._ask("GAINS?")
+        if st != "OK":
+            raise CoreDAQError(f"GAINS? failed: {payload}")
+        # Robust parse
+        parts = payload.replace("HEAD", "").replace("=", " ").split()
+        try:
+            # sequence should be: 1 v 2 v 3 v 4 v  -> take every 2nd number
+            nums = [int(parts[i]) for i in range(1, len(parts), 2)]
+            if len(nums) != 4:
+                raise ValueError
+            return tuple(nums)  # type: ignore[return-value]
+        except Exception:
+            raise CoreDAQError(f"Unexpected GAIN? payload: '{payload}'")
+
+    # Optional convenience per-head setters:
+    def set_gain1(self, value: int, apply: bool = True): self.set_gain(1, value, apply)
+    def set_gain2(self, value: int, apply: bool = True): self.set_gain(2, value, apply)
+    def set_gain3(self, value: int, apply: bool = True): self.set_gain(3, value, apply)
+    def set_gain4(self, value: int, apply: bool = True): self.set_gain(4, value, apply)
     # ---------- Frequency ----------
     def get_freq_hz(self) -> int:
         st, p = self._ask("FREQ?")
