@@ -1,9 +1,3 @@
-<!DOCTYPE html>
-<html lang="en">
-<head>
-  <meta charset="UTF-8">
-  <title>CoreDAQ Python API v3.0</title>
-</head>
 <body>
 
   <h1>CoreDAQ Python API v3.0</h1>
