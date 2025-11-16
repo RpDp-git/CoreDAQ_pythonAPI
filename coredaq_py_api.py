@@ -1,5 +1,5 @@
-# coredaq.py #v2.0 supported for Firmware v7.0 and up
-# High-level driver for CoreDAQ 
+# coredaq.py #v3.0
+# High-level driver for coreDAQ
 #
 # REQUIREMENTS:
 #   pip install pyserial
@@ -19,9 +19,13 @@ class CoreDAQError(Exception): pass
 
 
 class CoreDAQ:
+
     # Conversion constants (fits AD7606 ±5V range)
     FS_VOLTS = 5.0          # Full-scale magnitude
     CODES_PER_FS = 32768.0  # 16-bit signed full-scale
+
+    NUM_HEADS = 4
+    NUM_GAINS = 8
 
     def __init__(self, port: str, timeout: float = 0.05):
         self._ser = serial.Serial(
@@ -32,6 +36,15 @@ class CoreDAQ:
         )
         self._lock = threading.Lock()
         self._drain()
+
+        # 4×8 calibration table: [head-1][gain] -> slope (mV/W)
+        self._cal_slope = [
+            [0.0 for _ in range(self.NUM_GAINS)]
+            for _ in range(self.NUM_HEADS)
+        ]
+
+        # load calibration from MCU
+        self._load_calibration()
 
     # ---------- Lifecycle ----------
     def close(self):
@@ -87,6 +100,48 @@ class CoreDAQ:
         if st != "OK": raise CoreDAQError(p)
         return p
     
+    # ---------- calibration loader ----------
+    def _load_calibration(self):
+        """
+        Query all heads/gains via CAL <head> <gain> and populate
+        self._cal_slope[head-1][gain] with slope (mV/W) as float.
+        Expects reply: OK H<h> G<g> <HEX>
+        where <HEX> is little-endian IEEE754 float.
+        """
+        for head in range(1, self.NUM_HEADS + 1):
+            for gain in range(self.NUM_GAINS):
+                status, payload = self._ask(f"CAL {head} {gain}")
+                if status != "OK":
+                    raise CoreDAQError(f"CAL {head} {gain} failed: {payload}")
+
+                parts = payload.split()
+                if len(parts) != 3:
+                    raise CoreDAQError(f"Unexpected CAL reply: {payload!r}")
+
+                hex_str = parts[2]
+                try:
+                    bits = int(hex_str, 16)
+                    slope = struct.unpack(
+                        "<f", bits.to_bytes(4, byteorder="little")
+                    )[0]
+                except Exception as e:
+                    raise CoreDAQError(
+                        f"Failed to parse CAL {head} {gain} payload {payload!r}: {e}"
+                    )
+
+                self._cal_slope[head - 1][gain] = slope
+
+    # ---------- convenient accessor ----------
+    def get_cal_slope(self, head: int, gain: int) -> float:
+        """
+        Return slope (mV/W) for given head (1..4) and gain (0..7).
+        """
+        if not (1 <= head <= self.NUM_HEADS):
+            raise ValueError("head must be 1..4")
+        if not (0 <= gain < self.NUM_GAINS):
+            raise ValueError("gain must be 0..7")
+        return self._cal_slope[head - 1][gain]
+    
         # ---------- Triggered Acquisition ----------
     def trig_arm(self, frames: int, rising: bool = True):
         """
@@ -110,29 +165,112 @@ class CoreDAQ:
         return self._parse_int(p)
 
     # ---------- Snapshot ----------
-    def snapshot_mv(self, n_frames: int, timeout_s: float = 0.3) -> Tuple[float, float, float, float]:
+    def snapshot_mv(
+        self,
+        n_frames: int = 1,
+        timeout_s: float = 1.0,
+        poll_hz: float = 200.0,
+    ):
         """
-        Take a snapshot average of N samples at the current sampling rate.
-        Returns 4 voltages in millivolts (rounded to 0.1 mV).
+        Take a snapshot averaged over n_frames frames.
+        Returns:
+            (mv_list, gains_list)
+            - mv_list:   list of 4 ints (mV) [ch1..ch4]
+            - gains_list: list of 4 ints (gain index 0..7 for head1..4)
         """
-        st, p = self._ask(f"SNAP {n_frames}")
+        # Arm snapshot
+        st, payload = self._ask(f"SNAP {n_frames}")
         if st != "OK":
-            raise CoreDAQError(f"SNAP failed: {p}")
+            raise CoreDAQError(f"SNAP arm failed: {payload}")
 
         t0 = time.time()
+        sleep_s = 1.0 / poll_hz
+
         while True:
-            st, p = self._ask("SNAP?")
-            if st == "OK":
-                vals = tuple(int(x) for x in p.split())
-                # Convert to millivolts, rounded
-                return tuple(round(v, 1) for v in vals)
+            st, payload = self._ask("SNAP?")
+            if st == "BUSY":
+                if (time.time() - t0) > timeout_s:
+                    raise CoreDAQError("Snapshot timeout")
+                time.sleep(sleep_s)
+                continue
 
-            if time.time() - t0 > timeout_s:
-                self._ask("SNAP CANCEL")
-                raise CoreDAQError("Snapshot timeout")
+            if st != "OK":
+                raise CoreDAQError(f"SNAP? failed: {payload}")
 
-            time.sleep(0.005)
+            # Expected format:
+            # "<m0> <m1> <m2> <m3> G=<g1> <g2> <g3> <g4>"
+            parts = payload.split()
+            if len(parts) < 4:
+                raise CoreDAQError(f"SNAP? payload too short: {payload}")
 
+            # First 4 are mV readings
+            try:
+                mv = [int(parts[i]) for i in range(4)]
+            except ValueError as e:
+                raise CoreDAQError(f"Failed to parse mV from SNAP?: {payload}") from e
+
+            # Gains are optional but we expect "G=" marker now
+            gains = [0, 0, 0, 0]
+            if "G=" in parts:
+                gi = parts.index("G=")
+                if gi + 4 >= len(parts):
+                    raise CoreDAQError(f"SNAP? gain block incomplete: {payload}")
+                try:
+                    gains = [int(parts[gi+1]),
+                             int(parts[gi+2]),
+                             int(parts[gi+3]),
+                             int(parts[gi+4])]
+                except ValueError as e:
+                    raise CoreDAQError(f"Failed to parse gains from SNAP?: {payload}") from e
+            else:
+                # If firmware ever omits gains, leave zeros or raise:
+                # raise CoreDAQError("SNAP? did not include gain info")
+                pass
+
+            return mv, gains
+
+    def snapshot_mW(
+        self,
+        n_frames: int = 1,
+        timeout_s: float = 1.0,
+        poll_hz: float = 200.0,
+    ):
+        """
+        Take a calibrated snapshot and convert each channel to optical power in watts.
+        Uses per-head, per-gain slopes stored in self.cal_slopes[head][gain].
+
+        Returns:
+            (power_W, mv_list, gains_list)
+            - power_W: list of 4 floats in watts [head1..4]
+        """
+        mv, gains = self.snapshot_mv(n_frames=n_frames,
+                                     timeout_s=timeout_s,
+                                     poll_hz=poll_hz)
+
+        
+
+        power_W = [None] * 4
+        for ch in range(4):
+            head = ch  # head index 0..3 for heads 1..4
+            gain = gains[ch]
+
+            try:
+                slope_mV_per_W = self._cal_slope[head][gain]
+            except (IndexError, KeyError, TypeError):
+                raise CoreDAQError(
+                    f"No calibration slope for head {head+1}, gain {gain}"
+                )
+
+            if slope_mV_per_W is None or slope_mV_per_W == 0.0:
+                raise CoreDAQError(
+                    f"Invalid slope for head {head+1}, gain {gain}: {slope_mV_per_W}"
+                )
+
+            # Intercept is ignored by your choice (dominated by slope)
+            # P[W] = V[mV] / (slope[mV/W])
+            power_W[ch] = mv[ch] / slope_mV_per_W
+
+        return power_W, mv, gains
             
 
     # ---------- Streaming ----------
@@ -309,6 +447,7 @@ class CoreDAQ:
         st, p = self._ask("OS?")
         if st != "OK": raise CoreDAQError(p)
         return self._parse_int(p)
+
 
     # ---------- Helper: auto port discovery ----------
     @staticmethod
