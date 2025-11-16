@@ -3,9 +3,10 @@ import time
 from collections import deque
 import matplotlib.pyplot as plt
 from coredaq_py_api import CoreDAQ
+from numpy import round
 
-PORT = "/dev/tty.usbmodem2062346055301"
-WINDOW_SECONDS = 10        # length of view
+PORT = "/dev/tty.usbmodem2065344D55301"
+WINDOW_SECONDS = 5        # length of view
 UPDATE_HZ = 60             # plotting speed
 SNAP_FRAMES = 1            # average 1 frame
 ROUND_DEC = 1              # displayed precision
@@ -16,7 +17,6 @@ def main():
 
     print("Device:", daq.idn())
     daq.set_freq(1000)
-    daq.set_oversampling(7)
     daq.snapshot_mv(1)     # warm up read
 
     # Rolling buffers
@@ -37,7 +37,7 @@ def main():
 
     while True:
         # ---- Acquire one reading ----
-        mv = daq.snapshot_mv(SNAP_FRAMES)
+        mv = daq.snapshot_mv(SNAP_FRAMES)[0]
         now = time.time() - start
 
         t.append(now)
