@@ -11,7 +11,7 @@
 #       v = daq.snapshot_mv(8)
 #       print(v)
 
-import serial, time, struct, threading
+import serial, time, struct, threading, math
 import serial.tools.list_ports
 from typing import Optional, Tuple, List
 
@@ -284,92 +284,92 @@ class CoreDAQ:
         return power_W
 
     def snapshot_autogain_W(
-        self,
-        n_frames: int = 5,
-        min_mv: float = 50.0,
-        max_mv: float = 4500.0,
-        max_iters: int = 8,
-        settle_s: float = 0.005,
-    ):
-        """
-        Snapshot with auto-gain and convert to Watts.
+            self,
+            n_frames: int = 5,
+            min_mv: float = 50.0,
+            max_mv: float = 4500.0,
+            max_iters: int = 100,
+            settle_s: float = 0.05,
+        ):
+            """
+            Snapshot with auto-gain and convert to Watts.
 
-        Algorithm:
-          - Repeat up to max_iters:
-              * Take snapshot_mv(n_frames) → (mv[4], gains[4])
-              * For each channel i:
-                    if |mv[i]| < min_mv and gain[i] < 7 → gain++
-                    if |mv[i]| > max_mv and gain[i] > 0 → gain--
-                (calls set_gain(head, new_gain) for each change)
-              * If no channel changed gain in this iteration → stop.
-              * Wait settle_s seconds to let MCU I2C service apply changes.
-          - Take one final snapshot_mv(n_frames).
-          - Convert each channel mV → W using calibration slope.
+            - Iteratively adjusts gains so each channel's |mV| is in [min_mv, max_mv]
+            as far as possible (0 <= gain <= 7).
+            - Uses snapshot_mV(n_frames) which returns (mv[4], gains[4]).
+            - After gains settle, does one final snapshot and converts to Watts
+            using self._cal_slope[head_idx][gain] (mV/W) with power-LSB-based rounding.
 
-        Returns:
-            (power_W, mv_final, gains_final)
-              - power_W: [W_ch1, W_ch2, W_ch3, W_ch4]
-              - mv_final: final mV values from SNAP
-              - gains_final: final gain indices (0..7) per channel
-        """
+            Returns:
+                (power_W, mv_final, gains_final)
+            """
 
-        if not hasattr(self, "_cal_slope"):
-            raise RuntimeError("Calibration slopes not loaded on CoreDAQ instance (self._cal_slope missing).")
+            if not hasattr(self, "_cal_slope"):
+                raise CoreDAQError("Calibration slopes (self._cal_slope) not loaded.")
 
-        # --- Iterative gain adjustment ---
-        for _ in range(max_iters):
-            mv, gains = self.snapshot_mV(n_frames)  # mv: list[4], gains: list[4]
-            changed = False
+            # --- Iterative gain adjustment ---
+            for _ in range(max_iters):
+                mv, gains = self.snapshot_mV(n_frames)  # mv: list[4], gains: list[4]
+                changed = False
+
+                for ch in range(4):
+                    v = abs(float(mv[ch]))
+                    g = int(gains[ch])
+                    head = ch + 1  # heads are 1..4 at the protocol level
+
+                    if v < min_mv and g < 7:
+                        # too small -> increase gain
+                        self.set_gain(head, g + 1)
+                        changed = True
+                    elif v > max_mv and g > 0:
+                        # too large -> decrease gain
+                        self.set_gain(head, g - 1)
+                        changed = True
+
+                if not changed:
+                    # all channels in range (or at gain limits)
+                    break
+
+                # Let the MCU's main loop run I2C_Refresh once
+                time.sleep(settle_s)
+
+            # --- Final snapshot with settled gains ---
+            mv, gains = self.snapshot_mV(n_frames)
+
+            # --- Convert to Watts with LSB-based rounding ---
+            adc_mv_per_lsb = (self.FS_VOLTS * 1000.0) / self.CODES_PER_FS
+            power_W = []
 
             for ch in range(4):
-                head = ch + 1
-                v = abs(float(mv[ch]))
-                g = int(gains[ch])
+                head_idx = ch              # 0..3 in Python
+                gain = int(gains[ch])
+                mv_ch = float(mv[ch])
 
-                # Too low: bump gain up if possible
-                if v < min_mv and g < 7:
-                    self.set_gain(head, g + 1)
-                    changed = True
-                    continue
+                try:
+                    slope_mV_per_W = self._cal_slope[head_idx][gain]
+                except Exception as e:
+                    raise CoreDAQError(
+                        f"No calibration slope for head {head_idx+1}, gain {gain}"
+                    ) from e
 
-                # Too high: bump gain down if possible
-                if v > max_mv and g > 0:
-                    self.set_gain(head, g - 1)
-                    changed = True
-                    continue
+                if slope_mV_per_W is None or slope_mV_per_W == 0.0:
+                    raise CoreDAQError(
+                        f"Invalid slope for head {head_idx+1}, gain {gain}: {slope_mV_per_W}"
+                    )
 
-                # Otherwise: in-range or at limit → leave it
+                # Power LSB = ADC_mV_LSB / slope_mV_per_W
+                power_lsb = adc_mv_per_lsb / slope_mV_per_W
 
-            if not changed:
-                # All channels in acceptable band (or at limits) → done
-                break
+                # decimals = -log10(power_lsb), clamped to [0, 12]
+                if power_lsb <= 0.0:
+                    decimals = 0
+                else:
+                    decimals = max(0, min(12, round(-math.log10(power_lsb))))
 
-            # Give the MCU time to process I2C in its main loop
-            time.sleep(settle_s)
+                power = mv_ch / slope_mV_per_W
+                power_W.append(round(power, decimals))
 
-        # --- Final snapshot after gains settled ---
-        mv, gains = self.snapshot_mV(n_frames)
-
-        # --- Convert to Watts using calibration slopes ---
-        power_W = [0.0] * 4
-        for ch in range(4):
-            head = ch + 1
-            g = int(gains[ch])
-            v_mv = float(mv[ch])
-
-            try:
-                slope_mv_per_W = self._cal_slope[head-1][g]
-            except Exception as e:
-                raise RuntimeError(
-                    f"No calibration slope for head {head} gain {g}"
-                ) from e
-
-            if slope_mv_per_W <= 0.0:
-                power_W[ch] = float("nan")
-            else:
-                power_W[ch] = v_mv / slope_mv_per_W
-
-        return power_W, mv, gains
+            return power_W
             
 
     # ---------- Streaming ----------
@@ -452,6 +452,62 @@ class CoreDAQ:
 
         return ch
 
+
+    def transfer_frames_W(self, frames: int) -> List[List[float]]:
+        """
+        Transfers <frames> frames, converts them to optical power (W)
+        using per-head, per-gain calibration and sensible rounding.
+
+        Returns:
+            power_ch: [ch1_list, ch2_list, ch3_list, ch4_list] in watts
+        """
+
+        if not hasattr(self, "_cal_slope"):
+            raise CoreDAQError("Calibration slopes (self._cal_slope) not loaded.")
+
+        # 1) Get voltages in mV (4 x N)
+        mv_ch = self.transfer_frames_mV(frames)
+
+        # 2) Get current gains for each head (assumed fixed during acquisition)
+        gains = self.get_gains()  # e.g. [g1, g2, g3, g4]
+
+        # 3) Convert mV -> W with LSB-based rounding
+        adc_mv_per_lsb = (self.FS_VOLTS * 1000.0) / self.CODES_PER_FS
+        power_ch = [[], [], [], []]
+
+        for ch in range(4):
+            head_idx = ch
+            gain = int(gains[ch])
+
+            try:
+                slope_mV_per_W = self._cal_slope[head_idx][gain]
+            except Exception as e:
+                raise CoreDAQError(
+                    f"No calibration slope for head {head_idx+1}, gain {gain}"
+                ) from e
+
+            if slope_mV_per_W is None or slope_mV_per_W == 0.0:
+                raise CoreDAQError(
+                    f"Invalid slope for head {head_idx+1}, gain {gain}: {slope_mV_per_W}"
+                )
+
+            # Power LSB = ADC_mV_LSB / slope_mV_per_W
+            power_lsb = adc_mv_per_lsb / slope_mV_per_W
+
+            # decimals = -log10(power_lsb), clamped to [0, 12]
+            if power_lsb <= 0.0:
+                decimals = 0
+            else:
+                decimals = max(0, min(12, round(-math.log10(power_lsb))))
+
+            out_list = power_ch[ch]
+            for v_mv in mv_ch[ch]:
+                power = v_mv / slope_mV_per_W
+                out_list.append(round(power, decimals))
+
+        return power_ch
+    
+
     def i2c_refresh(self) -> None:
         #"""Apply pending I2C changes (SHT45 read, TCA6424 writes/reads, etc.)."""
         st, payload = self._ask("I2C REFRESH")
@@ -519,7 +575,70 @@ class CoreDAQ:
         if st != "OK": raise CoreDAQError(p)
         return self._parse_int(p)
 
+        # -------------------------------------------------------
+    # Temperature (SHT45 on board)
+    # -------------------------------------------------------
+    def get_head_temperature_C(self) -> float:
+        """
+        Returns board temperature in °C (float).
+        MCU returns:  OK <xx.x>
+        """
+        with self._lock:
+            self._writeln("TEMP?")
+            line = self._readline()
 
+        if not line.startswith("OK"):
+            raise CoreDAQError(f"TEMP? error: {line}")
+
+        val = line[3:].strip()
+        try:
+            return float(val)
+        except ValueError:
+            raise CoreDAQError(f"Bad TEMP format: '{val}'")
+
+    # -------------------------------------------------------
+    # Relative Humidity (%)
+    # -------------------------------------------------------
+    def get_head_humidity(self) -> float:
+        """
+        Returns relative humidity in % (float).
+        MCU returns:  OK <xx.x>
+        """
+        with self._lock:
+            self._writeln("HUM?")
+            line = self._readline()
+
+        if not line.startswith("OK"):
+            raise CoreDAQError(f"HUM? error: {line}")
+
+        val = line[3:].strip()
+        try:
+            return float(val)
+        except ValueError:
+            raise CoreDAQError(f"Bad HUM format: '{val}'")
+
+    # -------------------------------------------------------
+    # MCU Die Temperature (internal ADC)
+    # -------------------------------------------------------
+    def get_die_temperature_C(self) -> float:
+        """
+        Returns STM32 internal die temperature (°C).
+        MCU returns: OK <xx.x>
+        """
+        with self._lock:
+            self._writeln("DIE_TEMP?")
+            line = self._readline()
+
+        if not line.startswith("OK"):
+            raise CoreDAQError(f"DIE_TEMP? error: {line}")
+
+        val = line[3:].strip()
+        try:
+            return float(val)
+        except ValueError:
+            raise CoreDAQError(f"Bad DIE_TEMP format: '{val}'")
+        
+        
     # ---------- Helper: auto port discovery ----------
     @staticmethod
     def find():
