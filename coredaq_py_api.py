@@ -165,7 +165,7 @@ class CoreDAQ:
         return self._parse_int(p)
 
     # ---------- Snapshot ----------
-    def snapshot_mv(
+    def snapshot_mV(
         self,
         n_frames: int = 1,
         timeout_s: float = 1.0,
@@ -199,6 +199,7 @@ class CoreDAQ:
 
             # Expected format:
             # "<m0> <m1> <m2> <m3> G=<g1> <g2> <g3> <g4>"
+            # Example: "11 10 11 12 G=5 0 0 5"
             parts = payload.split()
             if len(parts) < 4:
                 raise CoreDAQError(f"SNAP? payload too short: {payload}")
@@ -209,27 +210,24 @@ class CoreDAQ:
             except ValueError as e:
                 raise CoreDAQError(f"Failed to parse mV from SNAP?: {payload}") from e
 
-            # Gains are optional but we expect "G=" marker now
+            # Gains: look for element containing "G="
             gains = [0, 0, 0, 0]
-            if "G=" in parts:
-                gi = parts.index("G=")
-                if gi + 4 >= len(parts):
-                    raise CoreDAQError(f"SNAP? gain block incomplete: {payload}")
-                try:
-                    gains = [int(parts[gi+1]),
-                             int(parts[gi+2]),
-                             int(parts[gi+3]),
-                             int(parts[gi+4])]
-                except ValueError as e:
-                    raise CoreDAQError(f"Failed to parse gains from SNAP?: {payload}") from e
-            else:
-                # If firmware ever omits gains, leave zeros or raise:
-                # raise CoreDAQError("SNAP? did not include gain info")
-                pass
+            for i, part in enumerate(parts):
+                if "G=" in part:
+                    # Found the marker, extract first gain from "G=<value>"
+                    try:
+                        gains[0] = int(part.split("=")[1])
+                        # Next 3 gains are in following elements
+                        gains[1] = int(parts[i + 1])
+                        gains[2] = int(parts[i + 2])
+                        gains[3] = int(parts[i + 3])
+                    except (ValueError, IndexError) as e:
+                        raise CoreDAQError(f"Failed to parse gains from SNAP?: {payload}") from e
+                    break
 
             return mv, gains
 
-    def snapshot_mW(
+    def snapshot_W(
         self,
         n_frames: int = 1,
         timeout_s: float = 1.0,
@@ -237,19 +235,25 @@ class CoreDAQ:
     ):
         """
         Take a calibrated snapshot and convert each channel to optical power in watts.
-        Uses per-head, per-gain slopes stored in self.cal_slopes[head][gain].
+        Uses per-head, per-gain slopes stored in self._cal_slope[head][gain] (mV/W).
+        Rounding is calculated from ADC resolution (16-bit, 5V reference):
+        - ADC code resolution: 5V / 32768 = 0.1526 mV per LSB
+        - Power precision: LSB / slope [mV/W]
 
         Returns:
-            (power_W, mv_list, gains_list)
-            - power_W: list of 4 floats in watts [head1..4]
+            list of 4 floats in watts [head1..4], with precision scaled to ADC and gain
         """
-        mv, gains = self.snapshot_mv(n_frames=n_frames,
+        import math
+        
+        mv, gains = self.snapshot_mV(n_frames=n_frames,
                                      timeout_s=timeout_s,
                                      poll_hz=poll_hz)
 
+        # ADC resolution: 16-bit, 5V reference
+        # mV per LSB = 5000 mV / 32768 codes
+        adc_mv_per_lsb = (self.FS_VOLTS * 1000) / self.CODES_PER_FS
         
-
-        power_W = [None] * 4
+        power_W = []
         for ch in range(4):
             head = ch  # head index 0..3 for heads 1..4
             gain = gains[ch]
@@ -266,14 +270,110 @@ class CoreDAQ:
                     f"Invalid slope for head {head+1}, gain {gain}: {slope_mV_per_W}"
                 )
 
-            # Intercept is ignored by your choice (dominated by slope)
-            # P[W] = V[mV] / (slope[mV/W])
-            power_W[ch] = mv[ch] / slope_mV_per_W
+            # Calculate power precision from ADC LSB
+            # Power LSB = ADC_mV_LSB / slope_mV_per_W
+            power_lsb = adc_mv_per_lsb / slope_mV_per_W
+            
+            # Determine decimal places needed to represent one LSB
+            # decimals = -log10(power_lsb), clamped to [0, 12]
+            decimals = max(0, min(12, round(-math.log10(power_lsb))))
+            
+            power = mv[ch] / slope_mV_per_W
+            power_W.append(round(power, decimals))
+
+        return power_W
+
+    def snapshot_autogain_W(
+        self,
+        n_frames: int = 5,
+        min_mv: float = 50.0,
+        max_mv: float = 4500.0,
+        max_iters: int = 8,
+        settle_s: float = 0.005,
+    ):
+        """
+        Snapshot with auto-gain and convert to Watts.
+
+        Algorithm:
+          - Repeat up to max_iters:
+              * Take snapshot_mv(n_frames) → (mv[4], gains[4])
+              * For each channel i:
+                    if |mv[i]| < min_mv and gain[i] < 7 → gain++
+                    if |mv[i]| > max_mv and gain[i] > 0 → gain--
+                (calls set_gain(head, new_gain) for each change)
+              * If no channel changed gain in this iteration → stop.
+              * Wait settle_s seconds to let MCU I2C service apply changes.
+          - Take one final snapshot_mv(n_frames).
+          - Convert each channel mV → W using calibration slope.
+
+        Returns:
+            (power_W, mv_final, gains_final)
+              - power_W: [W_ch1, W_ch2, W_ch3, W_ch4]
+              - mv_final: final mV values from SNAP
+              - gains_final: final gain indices (0..7) per channel
+        """
+
+        if not hasattr(self, "_cal_slope"):
+            raise RuntimeError("Calibration slopes not loaded on CoreDAQ instance (self._cal_slope missing).")
+
+        # --- Iterative gain adjustment ---
+        for _ in range(max_iters):
+            mv, gains = self.snapshot_mV(n_frames)  # mv: list[4], gains: list[4]
+            changed = False
+
+            for ch in range(4):
+                head = ch + 1
+                v = abs(float(mv[ch]))
+                g = int(gains[ch])
+
+                # Too low: bump gain up if possible
+                if v < min_mv and g < 7:
+                    self.set_gain(head, g + 1)
+                    changed = True
+                    continue
+
+                # Too high: bump gain down if possible
+                if v > max_mv and g > 0:
+                    self.set_gain(head, g - 1)
+                    changed = True
+                    continue
+
+                # Otherwise: in-range or at limit → leave it
+
+            if not changed:
+                # All channels in acceptable band (or at limits) → done
+                break
+
+            # Give the MCU time to process I2C in its main loop
+            time.sleep(settle_s)
+
+        # --- Final snapshot after gains settled ---
+        mv, gains = self.snapshot_mV(n_frames)
+
+        # --- Convert to Watts using calibration slopes ---
+        power_W = [0.0] * 4
+        for ch in range(4):
+            head = ch + 1
+            g = int(gains[ch])
+            v_mv = float(mv[ch])
+
+            try:
+                slope_mv_per_W = self._cal_slope[head-1][g]
+            except Exception as e:
+                raise RuntimeError(
+                    f"No calibration slope for head {head} gain {g}"
+                ) from e
+
+            if slope_mv_per_W <= 0.0:
+                power_W[ch] = float("nan")
+            else:
+                power_W[ch] = v_mv / slope_mv_per_W
 
         return power_W, mv, gains
             
 
     # ---------- Streaming ----------
+
     def acq_arm(self, frames: int):
         st, p = self._ask(f"ACQ ARM {frames}")
         if st != "OK": raise CoreDAQError(p)
@@ -309,7 +409,7 @@ class CoreDAQ:
     
      
     # ---------- Bulk Data Transfer ----------
-    def transfer_frames_mv(self, frames: int) -> List[List[float]]:
+    def transfer_frames_mV(self, frames: int) -> List[List[float]]:
         """
         Transfers <frames> frames (each 4 channels) from SDRAM.
         Returns: [ch1_list, ch2_list, ch3_list, ch4_list] in millivolts.
@@ -358,10 +458,10 @@ class CoreDAQ:
         if st != "OK":
             raise CoreDAQError(f"I2C REFRESH failed: {payload}")
 
-    def set_gain(self, head: int, value: int, apply: bool = True) -> None:
+    def set_gain(self, head: int, value: int) -> None:
         """
-        Queue gain change for a single head (1..4), value 0..7.
-        Automatically calls I2C REFRESH unless apply=False.
+        Set gain for a single head (1..4), value 0..7.
+        The gain is applied immediately by the firmware; no I2C refresh required.
         """
         if head not in (1, 2, 3, 4):
             raise ValueError("head must be 1..4")
@@ -372,37 +472,8 @@ class CoreDAQ:
         if st != "OK":
             raise CoreDAQError(f"GAIN {head} failed: {payload}")
 
-        if apply:
-            self.i2c_refresh()
+       
 
-    def set_gains(self, g1: int | None = None, g2: int | None = None,
-                g3: int | None = None, g4: int | None = None,
-                apply: bool = True) -> None:
-        """
-        Queue multiple gains at once; only heads with non-None values are changed.
-        Automatically calls I2C REFRESH unless apply=False.
-        """
-        updates = []
-        if g1 is not None:
-            if not (0 <= g1 <= 7): raise ValueError("g1 must be 0..7")
-            updates.append(("GAIN 1", g1))
-        if g2 is not None:
-            if not (0 <= g2 <= 7): raise ValueError("g2 must be 0..7")
-            updates.append(("GAIN 2", g2))
-        if g3 is not None:
-            if not (0 <= g3 <= 7): raise ValueError("g3 must be 0..7")
-            updates.append(("GAIN 3", g3))
-        if g4 is not None:
-            if not (0 <= g4 <= 7): raise ValueError("g4 must be 0..7")
-            updates.append(("GAIN 4", g4))
-
-        for cmd, val in updates:
-            st, payload = self._ask(f"{cmd} {val}")
-            if st != "OK":
-                raise CoreDAQError(f"{cmd} failed: {payload}")
-
-        if updates and apply:
-            self.i2c_refresh()
 
     def get_gains(self) -> tuple[int, int, int, int]:
         """
@@ -424,10 +495,10 @@ class CoreDAQ:
             raise CoreDAQError(f"Unexpected GAIN? payload: '{payload}'")
 
     # Optional convenience per-head setters:
-    def set_gain1(self, value: int, apply: bool = True): self.set_gain(1, value, apply)
-    def set_gain2(self, value: int, apply: bool = True): self.set_gain(2, value, apply)
-    def set_gain3(self, value: int, apply: bool = True): self.set_gain(3, value, apply)
-    def set_gain4(self, value: int, apply: bool = True): self.set_gain(4, value, apply)
+    def set_gain1(self, value: int): self.set_gain(1, value)
+    def set_gain2(self, value: int): self.set_gain(2, value)
+    def set_gain3(self, value: int): self.set_gain(3, value)
+    def set_gain4(self, value: int): self.set_gain(4, value)
     # ---------- Frequency ----------
     def get_freq_hz(self) -> int:
         st, p = self._ask("FREQ?")
