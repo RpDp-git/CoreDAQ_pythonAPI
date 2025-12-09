@@ -1,4 +1,4 @@
-# coredaq.py #v3.0
+# coredaq.py #v4.0
 # High-level driver for coreDAQ
 #
 # REQUIREMENTS:
@@ -27,6 +27,32 @@ class CoreDAQ:
     NUM_HEADS = 4
     NUM_GAINS = 8
 
+    # Nominal maximum recommended optical power per gain (in watts), based on
+    # ~4 V at the ADC input and your calibrated slopes, rounded to nice values.
+    # Index = gain 0..7
+    GAIN_MAX_POWER_W = [
+        4e-3,      # G0: 4 mW
+        2e-3,      # G1: 2 mW
+        800e-6,    # G2: 800 µW
+        400e-6,    # G3: 400 µW
+        80e-6,     # G4: 80 µW
+        40e-6,     # G5: 40 µW
+        4e-6,      # G6: 4 µW
+        400e-9,    # G7: 400 nW
+    ]
+
+    # Human-readable labels for each gain for use in UIs / metadata.
+    GAIN_LABELS = [
+        "4 mW",
+        "2 mW",
+        "800 µW",
+        "400 µW",
+        "80 µW",
+        "40 µW",
+        "4 µW",
+        "400 nW",
+    ]
+
     def __init__(self, port: str, timeout: float = 0.05):
         self._ser = serial.Serial(
             port=port,
@@ -42,6 +68,21 @@ class CoreDAQ:
             [0.0 for _ in range(self.NUM_GAINS)]
             for _ in range(self.NUM_HEADS)
         ]
+        # Matching 4×8 intercept table: [head-1][gain] -> intercept (mV)
+        self._cal_intercept = [
+            [0.0 for _ in range(self.NUM_GAINS)]
+            for _ in range(self.NUM_HEADS)
+        ]
+        # Per-channel, per-gain software zero in mV: [head-1][gain]
+        # By default no zeroing is applied; see zero_channel()/use_zero flags.
+        self._zero_mv = [
+            [0.0 for _ in range(self.NUM_GAINS)]
+            for _ in range(self.NUM_HEADS)
+        ]
+        # Deadband threshold: treat anything below this as zero (mV)
+        self._mv_zero_threshold = 15.0
+        # Saturation clamp in mV for over-range (when calibration would give negative power)
+        self._sat_mv = 4900.0
 
         # load calibration from MCU
         self._load_calibration()
@@ -104,9 +145,13 @@ class CoreDAQ:
     def _load_calibration(self):
         """
         Query all heads/gains via CAL <head> <gain> and populate
-        self._cal_slope[head-1][gain] with slope (mV/W) as float.
-        Expects reply: OK H<h> G<g> <HEX>
-        where <HEX> is little-endian IEEE754 float.
+        self._cal_slope[head-1][gain] with slope (mV/W) and
+        self._cal_intercept[head-1][gain] with intercept (mV).
+
+        Expects reply from firmware:
+            OK H<h> G<g> S=<SLOPE_HEX> I=<INTERCEPT_HEX>
+
+        where <SLOPE_HEX> and <INTERCEPT_HEX> are IEEE754 float bit patterns.
         """
         for head in range(1, self.NUM_HEADS + 1):
             for gain in range(self.NUM_GAINS):
@@ -114,22 +159,35 @@ class CoreDAQ:
                 if status != "OK":
                     raise CoreDAQError(f"CAL {head} {gain} failed: {payload}")
 
+                # Example payload: "H1 G0 S=497737AA I=BE68C719"
                 parts = payload.split()
-                if len(parts) != 3:
+                if len(parts) < 4:
                     raise CoreDAQError(f"Unexpected CAL reply: {payload!r}")
 
-                hex_str = parts[2]
+                slope_hex = None
+                intercept_hex = None
+                for token in parts:
+                    if token.startswith("S="):
+                        slope_hex = token.split("=", 1)[1]
+                    elif token.startswith("I="):
+                        intercept_hex = token.split("=", 1)[1]
+
+                if slope_hex is None or intercept_hex is None:
+                    raise CoreDAQError(f"Missing S= or I= in CAL reply: {payload!r}")
+
                 try:
-                    bits = int(hex_str, 16)
-                    slope = struct.unpack(
-                        "<f", bits.to_bytes(4, byteorder="little")
-                    )[0]
+                    slope_bits = int(slope_hex, 16)
+                    intercept_bits = int(intercept_hex, 16)
+
+                    slope = struct.unpack("<f", slope_bits.to_bytes(4, byteorder="little"))[0]
+                    intercept = struct.unpack("<f", intercept_bits.to_bytes(4, byteorder="little"))[0]
                 except Exception as e:
                     raise CoreDAQError(
                         f"Failed to parse CAL {head} {gain} payload {payload!r}: {e}"
                     )
 
                 self._cal_slope[head - 1][gain] = slope
+                self._cal_intercept[head - 1][gain] = intercept
 
     # ---------- convenient accessor ----------
     def get_cal_slope(self, head: int, gain: int) -> float:
@@ -141,7 +199,100 @@ class CoreDAQ:
         if not (0 <= gain < self.NUM_GAINS):
             raise ValueError("gain must be 0..7")
         return self._cal_slope[head - 1][gain]
-    
+
+    def get_cal_intercept(self, head: int, gain: int) -> float:
+        """
+        Return intercept (mV) for given head (1..4) and gain (0..7).
+        """
+        if not (1 <= head <= self.NUM_HEADS):
+            raise ValueError("head must be 1..4")
+        if not (0 <= gain < self.NUM_GAINS):
+            raise ValueError("gain must be 0..7")
+        return self._cal_intercept[head - 1][gain]
+
+    # ---------- Gain range helpers ----------
+
+    def gain_max_power_W(self, gain: int) -> float:
+        """
+        Return the nominal maximum recommended optical power (in watts)
+        for a given gain index 0..7, based on ~4 V at the ADC input and
+        your calibrated slopes, rounded to convenient values.
+
+        This is a *guideline* for UI / autogain / documentation; the actual
+        calibrated conversion still uses per-head, per-gain slope & intercept.
+        """
+        if not (0 <= gain < self.NUM_GAINS):
+            raise ValueError("gain must be 0..7")
+        return self.GAIN_MAX_POWER_W[gain]
+
+    def gain_label(self, gain: int) -> str:
+        """
+        Return a human-readable label for a given gain, e.g.
+        'G2 (≤ 800 µW)'.
+        """
+        if not (0 <= gain < self.NUM_GAINS):
+            raise ValueError("gain must be 0..7")
+        return self.GAIN_LABELS[gain]
+
+    def all_gain_labels(self) -> List[str]:
+        """
+        Return a list of human-readable labels for all gains G0..G7.
+        Useful for populating comboboxes in UIs.
+        """
+        return list(self.GAIN_LABELS)
+
+    def zero_channel(
+        self,
+        channel: int,
+        n_frames: int = 20,
+        timeout_s: float = 1.0,
+        poll_hz: float = 200.0,
+    ):
+        """
+        Measure 'dark' baseline for a single channel over all gains (0..7)
+        and store per-gain zeros in mV.
+
+        This populates self._zero_mv[head-1][gain] for the given channel.
+        By default zeroing is NOT applied in conversions unless use_zero=True.
+        """
+        if not (1 <= channel <= self.NUM_HEADS):
+            raise ValueError("channel must be 1..4")
+
+        head_idx = channel - 1
+        # remember original gain so we can restore it
+        orig_gains = self.get_gains()
+        orig_gain = orig_gains[head_idx]
+
+        try:
+            for gain in range(self.NUM_GAINS):
+                # set gain for this channel
+                self.set_gain(channel, gain)
+                # allow hardware to settle a bit
+                time.sleep(0.02)
+                mv_list, _gains = self.snapshot_mV(
+                    n_frames=n_frames,
+                    timeout_s=timeout_s,
+                    poll_hz=poll_hz,
+                )
+                self._zero_mv[head_idx][gain] = float(mv_list[head_idx])
+        finally:
+            # restore original gain on that channel
+            self.set_gain(channel, orig_gain)
+
+    def zero_channels(
+        self,
+        n_frames: int = 20,
+        timeout_s: float = 1.0,
+        poll_hz: float = 200.0,
+    ):
+        """
+        Convenience: zero all channels over all gains.
+        Calls zero_channel(1..4) in sequence.
+        """
+        for ch in range(1, self.NUM_HEADS + 1):
+            self.zero_channel(ch, n_frames=n_frames,
+                              timeout_s=timeout_s, poll_hz=poll_hz)
+
         # ---------- Triggered Acquisition ----------
     def trig_arm(self, frames: int, rising: bool = True):
         """
@@ -210,6 +361,15 @@ class CoreDAQ:
             except ValueError as e:
                 raise CoreDAQError(f"Failed to parse mV from SNAP?: {payload}") from e
 
+            # If the front-end/ADC is saturated at high input power, the AD7606 in
+            # bipolar ±5 V mode can report negative codes even though physically
+            # the input is "high and clamped". For the purposes of this API, treat
+            # any negative mV as a saturated reading near +full-scale so that
+            # higher-level code does not have to reason about negative power.
+            for i in range(4):
+                if mv[i] < 0:
+                    mv[i] = int(self._sat_mv)
+
             # Gains: look for element containing "G="
             gains = [0, 0, 0, 0]
             for i, part in enumerate(parts):
@@ -232,54 +392,82 @@ class CoreDAQ:
         n_frames: int = 1,
         timeout_s: float = 1.0,
         poll_hz: float = 200.0,
+        use_zero: bool = False,
     ):
         """
         Take a calibrated snapshot and convert each channel to optical power in watts.
-        Uses per-head, per-gain slopes stored in self._cal_slope[head][gain] (mV/W).
-        Rounding is calculated from ADC resolution (16-bit, 5V reference):
-        - ADC code resolution: 5V / 32768 = 0.1526 mV per LSB
-        - Power precision: LSB / slope [mV/W]
+
+        Uses per-head, per-gain slopes and intercepts stored in:
+            self._cal_slope[head][gain]     (mV/W)
+            self._cal_intercept[head][gain] (mV)
+
+        A per-channel software zero (self._zero_mv[ch]) and a small deadband
+        (self._mv_zero_threshold, in mV) are applied so that:
+            - the ADC's ~5 mV offset floor is removed in software
+            - anything below the threshold is treated as 0 W
 
         Returns:
-            list of 4 floats in watts [head1..4], with precision scaled to ADC and gain
+            list of 4 floats in watts [head1..4], with precision scaled to ADC and gain.
         """
         import math
-        
-        mv, gains = self.snapshot_mV(n_frames=n_frames,
-                                     timeout_s=timeout_s,
-                                     poll_hz=poll_hz)
+
+        mv, gains = self.snapshot_mV(
+            n_frames=n_frames,
+            timeout_s=timeout_s,
+            poll_hz=poll_hz,
+        )
 
         # ADC resolution: 16-bit, 5V reference
-        # mV per LSB = 5000 mV / 32768 codes
-        adc_mv_per_lsb = (self.FS_VOLTS * 1000) / self.CODES_PER_FS
-        
+        adc_mv_per_lsb = (self.FS_VOLTS * 1000.0) / self.CODES_PER_FS
+
         power_W = []
         for ch in range(4):
-            head = ch  # head index 0..3 for heads 1..4
-            gain = gains[ch]
+            head_idx = ch  # 0..3 for heads 1..4
+            gain = int(gains[ch])
 
             try:
-                slope_mV_per_W = self._cal_slope[head][gain]
+                slope_mV_per_W = self._cal_slope[head_idx][gain]
+                intercept_mV = self._cal_intercept[head_idx][gain]
             except (IndexError, KeyError, TypeError):
                 raise CoreDAQError(
-                    f"No calibration slope for head {head+1}, gain {gain}"
+                    f"No calibration data for head {head_idx+1}, gain {gain}"
                 )
 
             if slope_mV_per_W is None or slope_mV_per_W == 0.0:
                 raise CoreDAQError(
-                    f"Invalid slope for head {head+1}, gain {gain}: {slope_mV_per_W}"
+                    f"Invalid slope for head {head_idx+1}, gain {gain}: {slope_mV_per_W}"
                 )
 
-            # Calculate power precision from ADC LSB
+            # Apply software zero (baseline) if requested
+            mv_corr = float(mv[ch])
+            if use_zero:
+                mv_corr -= float(self._zero_mv[head_idx][gain])
+
+            # Saturation handling: if we ever see a negative mV (which should not
+            # occur physically), treat it as a clamp at ~full scale before applying
+            # calibration.
+            if mv_corr < 0.0:
+                mv_corr = self._sat_mv
+
+            # Deadband: anything below threshold is treated as 0 W
+            if abs(mv_corr) < self._mv_zero_threshold:
+                power_W.append(0.0)
+                continue
+
             # Power LSB = ADC_mV_LSB / slope_mV_per_W
             power_lsb = adc_mv_per_lsb / slope_mV_per_W
-            
-            # Determine decimal places needed to represent one LSB
-            # decimals = -log10(power_lsb), clamped to [0, 12]
-            decimals = max(0, min(12, round(-math.log10(power_lsb))))
-            
-            power = mv[ch] / slope_mV_per_W
-            power_W.append(round(power, decimals))
+            if power_lsb <= 0.0:
+                decimals = 0
+            else:
+                decimals = max(0, min(12, round(-math.log10(power_lsb))))
+
+            # Calibration model: mV_corr = slope * P + intercept  =>  P = (mV_corr - intercept) / slope
+            p_w = (mv_corr - intercept_mV) / slope_mV_per_W
+            # In principle p_w should now be >= 0; keep a tiny safety clamp.
+            if p_w < 0.0:
+                p_w = 0.0
+
+            power_W.append(round(p_w, decimals))
 
         return power_W
 
@@ -290,88 +478,103 @@ class CoreDAQ:
             max_mv: float = 4500.0,
             max_iters: int = 100,
             settle_s: float = 0.05,
+            use_zero: bool = False,
         ):
-            """
-            Snapshot with auto-gain and convert to Watts.
+        """
+        Snapshot with auto-gain and convert to Watts.
 
-            - Iteratively adjusts gains so each channel's |mV| is in [min_mv, max_mv]
-            as far as possible (0 <= gain <= 7).
-            - Uses snapshot_mV(n_frames) which returns (mv[4], gains[4]).
-            - After gains settle, does one final snapshot and converts to Watts
-            using self._cal_slope[head_idx][gain] (mV/W) with power-LSB-based rounding.
+        - Iteratively adjusts gains so each channel's |mV| is in [min_mv, max_mv]
+        as far as possible (0 <= gain <= 7).
+        - Uses snapshot_mV(n_frames) which returns (mv[4], gains[4]).
+        - After gains settle, does one final snapshot and converts to Watts
+        using self._cal_slope[head_idx][gain] (mV/W) with power-LSB-based rounding.
 
-            Returns:
-                (power_W, mv_final, gains_final)
-            """
+        Returns:
+            (power_W, mv_final, gains_final)
+        """
 
-            if not hasattr(self, "_cal_slope"):
-                raise CoreDAQError("Calibration slopes (self._cal_slope) not loaded.")
+        if not hasattr(self, "_cal_slope"):
+            raise CoreDAQError("Calibration slopes (self._cal_slope) not loaded.")
 
-            # --- Iterative gain adjustment ---
-            for _ in range(max_iters):
-                mv, gains = self.snapshot_mV(n_frames)  # mv: list[4], gains: list[4]
-                changed = False
-
-                for ch in range(4):
-                    v = abs(float(mv[ch]))
-                    g = int(gains[ch])
-                    head = ch + 1  # heads are 1..4 at the protocol level
-
-                    if v < min_mv and g < 7:
-                        # too small -> increase gain
-                        self.set_gain(head, g + 1)
-                        changed = True
-                    elif v > max_mv and g > 0:
-                        # too large -> decrease gain
-                        self.set_gain(head, g - 1)
-                        changed = True
-
-                if not changed:
-                    # all channels in range (or at gain limits)
-                    break
-
-                # Let the MCU's main loop run I2C_Refresh once
-                time.sleep(settle_s)
-
-            # --- Final snapshot with settled gains ---
-            mv, gains = self.snapshot_mV(n_frames)
-
-            # --- Convert to Watts with LSB-based rounding ---
-            adc_mv_per_lsb = (self.FS_VOLTS * 1000.0) / self.CODES_PER_FS
-            power_W = []
+        # --- Iterative gain adjustment ---
+        for _ in range(max_iters):
+            mv, gains = self.snapshot_mV(n_frames)  # mv: list[4], gains: list[4]
+            changed = False
 
             for ch in range(4):
-                head_idx = ch              # 0..3 in Python
-                gain = int(gains[ch])
-                mv_ch = float(mv[ch])
+                v = abs(float(mv[ch]))
+                g = int(gains[ch])
+                head = ch + 1  # heads are 1..4 at the protocol level
 
-                try:
-                    slope_mV_per_W = self._cal_slope[head_idx][gain]
-                except Exception as e:
-                    raise CoreDAQError(
-                        f"No calibration slope for head {head_idx+1}, gain {gain}"
-                    ) from e
+                if v < min_mv and g < 7:
+                    # too small -> increase gain
+                    self.set_gain(head, g + 1)
+                    changed = True
+                elif v > max_mv and g > 0:
+                    # too large -> decrease gain
+                    self.set_gain(head, g - 1)
+                    changed = True
 
-                if slope_mV_per_W is None or slope_mV_per_W == 0.0:
-                    raise CoreDAQError(
-                        f"Invalid slope for head {head_idx+1}, gain {gain}: {slope_mV_per_W}"
-                    )
+            if not changed:
+                # all channels in range (or at gain limits)
+                break
 
-                # Power LSB = ADC_mV_LSB / slope_mV_per_W
-                power_lsb = adc_mv_per_lsb / slope_mV_per_W
+            # Let the MCU's main loop run I2C_Refresh once
+            time.sleep(settle_s)
 
-                # decimals = -log10(power_lsb), clamped to [0, 12]
-                if power_lsb <= 0.0:
-                    decimals = 0
-                else:
-                    decimals = max(0, min(12, round(-math.log10(power_lsb))))
+        # --- Final snapshot with settled gains ---
+        mv, gains = self.snapshot_mV(n_frames)
 
-                power = mv_ch / slope_mV_per_W
-                power_W.append(round(power, decimals))
+        # --- Convert to Watts with LSB-based rounding and zeroing ---
+        adc_mv_per_lsb = (self.FS_VOLTS * 1000.0) / self.CODES_PER_FS
+        power_W = []
 
-            return power_W
-            
+        for ch in range(4):
+            head_idx = ch              # 0..3 in Python
+            gain = int(gains[ch])
+            mv_ch = float(mv[ch])
 
+            try:
+                slope_mV_per_W = self._cal_slope[head_idx][gain]
+                intercept_mV = self._cal_intercept[head_idx][gain]
+            except Exception as e:
+                raise CoreDAQError(
+                    f"No calibration data for head {head_idx+1}, gain {gain}"
+                ) from e
+
+            if slope_mV_per_W is None or slope_mV_per_W == 0.0:
+                raise CoreDAQError(
+                    f"Invalid slope for head {head_idx+1}, gain {gain}: {slope_mV_per_W}"
+                )
+
+            # Apply software zero if requested
+            mv_corr = mv_ch
+            if use_zero:
+                mv_corr -= float(self._zero_mv[head_idx][gain])
+
+            # Saturation handling in mV domain
+            if mv_corr < 0.0:
+                mv_corr = self._sat_mv
+
+            # Deadband
+            if abs(mv_corr) < self._mv_zero_threshold:
+                power_W.append(0.0)
+                continue
+
+            # Power LSB = ADC_mV_LSB / slope_mV_per_W
+            power_lsb = adc_mv_per_lsb / slope_mV_per_W
+            if power_lsb <= 0.0:
+                decimals = 0
+            else:
+                decimals = max(0, min(12, round(-math.log10(power_lsb))))
+
+            p_w = (mv_corr - intercept_mV) / slope_mV_per_W
+            if p_w < 0.0:
+                p_w = 0.0
+
+            power_W.append(round(p_w, decimals))
+
+        return power_W, mv, gains
     # ---------- Streaming ----------
 
     def acq_arm(self, frames: int):
@@ -453,7 +656,7 @@ class CoreDAQ:
         return ch
 
 
-    def transfer_frames_W(self, frames: int) -> List[List[float]]:
+    def transfer_frames_W(self, frames: int, use_zero: bool = False) -> List[List[float]]:
         """
         Transfers <frames> frames, converts them to optical power (W)
         using per-head, per-gain calibration and sensible rounding.
@@ -462,8 +665,8 @@ class CoreDAQ:
             power_ch: [ch1_list, ch2_list, ch3_list, ch4_list] in watts
         """
 
-        if not hasattr(self, "_cal_slope"):
-            raise CoreDAQError("Calibration slopes (self._cal_slope) not loaded.")
+        if not hasattr(self, "_cal_slope") or not hasattr(self, "_cal_intercept"):
+            raise CoreDAQError("Calibration data (_cal_slope/_cal_intercept) not loaded.")
 
         # 1) Get voltages in mV (4 x N)
         mv_ch = self.transfer_frames_mV(frames)
@@ -471,7 +674,7 @@ class CoreDAQ:
         # 2) Get current gains for each head (assumed fixed during acquisition)
         gains = self.get_gains()  # e.g. [g1, g2, g3, g4]
 
-        # 3) Convert mV -> W with LSB-based rounding
+        # 3) Convert mV -> W with LSB-based rounding and zeroing
         adc_mv_per_lsb = (self.FS_VOLTS * 1000.0) / self.CODES_PER_FS
         power_ch = [[], [], [], []]
 
@@ -481,9 +684,10 @@ class CoreDAQ:
 
             try:
                 slope_mV_per_W = self._cal_slope[head_idx][gain]
+                intercept_mV = self._cal_intercept[head_idx][gain]
             except Exception as e:
                 raise CoreDAQError(
-                    f"No calibration slope for head {head_idx+1}, gain {gain}"
+                    f"No calibration data for head {head_idx+1}, gain {gain}"
                 ) from e
 
             if slope_mV_per_W is None or slope_mV_per_W == 0.0:
@@ -493,8 +697,6 @@ class CoreDAQ:
 
             # Power LSB = ADC_mV_LSB / slope_mV_per_W
             power_lsb = adc_mv_per_lsb / slope_mV_per_W
-
-            # decimals = -log10(power_lsb), clamped to [0, 12]
             if power_lsb <= 0.0:
                 decimals = 0
             else:
@@ -502,8 +704,24 @@ class CoreDAQ:
 
             out_list = power_ch[ch]
             for v_mv in mv_ch[ch]:
-                power = v_mv / slope_mV_per_W
-                out_list.append(round(power, decimals))
+                mv_corr = float(v_mv)
+                if use_zero:
+                    mv_corr -= float(self._zero_mv[head_idx][gain])
+
+                # Saturation handling in mV domain
+                if mv_corr < 0.0:
+                    mv_corr = self._sat_mv
+
+                # Deadband
+                if abs(mv_corr) < self._mv_zero_threshold:
+                    out_list.append(0.0)
+                    continue
+
+                p_w = (mv_corr - intercept_mV) / slope_mV_per_W
+                if p_w < 0.0:
+                    p_w = 0.0
+
+                out_list.append(round(p_w, decimals))
 
         return power_ch
     
