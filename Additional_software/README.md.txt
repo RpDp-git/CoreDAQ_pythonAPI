@@ -1,1 +1,0 @@
-The laser driver is written for TSL 770.. If using TSL 570 select legacy commands on the laser
