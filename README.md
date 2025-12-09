@@ -1,6 +1,6 @@
 <body>
 
-  <h1>CoreDAQ Python API v3.0</h1>
+  <h1>CoreDAQ Python API v4.0</h1>
 
   <p>
     High-level Python driver for the <strong>CoreDAQ</strong> 4-channel photonic data-acquisition system.
