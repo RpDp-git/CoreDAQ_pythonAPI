@@ -1,536 +1,317 @@
 # plotter_tab.py
 
-import numpy as np
-from typing import List, Tuple
+from __future__ import annotations
 
+from typing import List, Optional
+
+import numpy as np
 from PyQt5 import QtCore, QtGui, QtWidgets
 import pyqtgraph as pg
-import serial.tools.list_ports
 
-from channels import (
-    ChannelManager,
-    safe_eval_expression,
-    COLOR_CYCLE,
-)
+from channels import ChannelManager, ChannelConfig
 
-from coredaq_py_api import CoreDAQ, CoreDAQError
-
-
-# ------------- Live plotting parameters -------------
+# live plotting params
 WINDOW_SECONDS = 5.0      # time window length (s)
 UPDATE_HZ = 50.0          # snapshot polling rate (Hz)
 SAMPLES_PER_WINDOW = int(WINDOW_SECONDS * UPDATE_HZ)
 
-DEFAULT_PORT = "COM14"    # fallback port if auto-detect finds nothing
+pg.setConfigOptions(antialias=True)
 
 
-# ------------- Utility: power unit formatting -------------
-def format_power_W(p_W: float) -> Tuple[str, str]:
-    """
-    Convert power in W to a nice value+unit string, using mW / µW / nW.
-    Returns (value_str, unit_str).
-    """
-    if p_W is None or not np.isfinite(p_W):
-        return "--", "mW"
-
-    mag = abs(p_W)
-    if mag >= 1e-3:
-        return f"{p_W * 1e3:,.3g}", "mW"
-    elif mag >= 1e-6:
-        return f"{p_W * 1e6:,.3g}", "µW"
-    else:
-        return f"{p_W * 1e9:,.3g}", "nW"
-
-
-# ------------- Channel card widget -------------
-class ChannelCard(QtWidgets.QFrame):
-    """
-    One card in the Plotter grid.
-    Shows:
-      - Title ("Channel 1", "Math 1", "Relative 1", ...)
-      - Optional gain combobox (for physical channels)
-      - Live value (right-aligned, with auto unit)
-      - pyqtgraph plot in black background
-    """
-    def __init__(
-        self,
-        title: str,
-        color: str,
-        is_physical: bool,
-        gain_changed_cb=None,
-        phys_index: int = None,
-        parent=None,
-    ):
-        super().__init__(parent)
-        self.setObjectName("ChannelCard")
-
-        self.color = color
-        self.is_physical = is_physical
-        self.gain_changed_cb = gain_changed_cb
-        self.phys_index = phys_index
-
-        self.plot: pg.PlotWidget = None
-        self.curve: pg.PlotDataItem = None
-        self.lbl_value = None
-        self.lbl_unit = None
-        self.gain_combo = None
-
-        self._build_ui(title)
-
-    def _build_ui(self, title: str):
-        self.setMinimumHeight(200)
-        self.setSizePolicy(
-            QtWidgets.QSizePolicy.Expanding,
-            QtWidgets.QSizePolicy.Expanding,
-        )
-
-        layout = QtWidgets.QVBoxLayout(self)
-        layout.setContentsMargins(10, 10, 10, 10)
-        layout.setSpacing(6)
-
-        # ---- Header: title + (optional) gain + value ----
-        header = QtWidgets.QHBoxLayout()
-        header.setContentsMargins(0, 0, 0, 0)
-        header.setSpacing(8)
-
-        lbl_title = QtWidgets.QLabel(title)
-        title_font = lbl_title.font()
-        title_font.setPointSize(int(title_font.pointSize() * 1.3))
-        title_font.setBold(True)
-        lbl_title.setFont(title_font)
-        lbl_title.setStyleSheet("color: #ffffff;")
-        header.addWidget(lbl_title)
-
-        # Gain combobox only for physical channels
-        if self.is_physical and self.gain_changed_cb is not None:
-            self.gain_combo = QtWidgets.QComboBox()
-            self.gain_combo.setFixedWidth(90)
-            self.gain_combo.setToolTip("Channel gain")
-            try:
-                labels = CoreDAQ.GAIN_LABELS
-            except Exception:
-                labels = [f"G{g}" for g in range(8)]
-            for g in range(8):
-                label_item = labels[g] if g < len(labels) else f"G{g}"
-                self.gain_combo.addItem(label_item, g)
-            self.gain_combo.setCurrentIndex(0)
-            self.gain_combo.currentIndexChanged[int].connect(
-                lambda value, idx=self.phys_index: self.gain_changed_cb(idx, value)
-            )
-            header.addWidget(self.gain_combo)
-
-        header.addStretch(1)
-
-        # Value + unit on the right
-        self.lbl_value = QtWidgets.QLabel("--")
-        self.lbl_unit = QtWidgets.QLabel("mW")
-
-        val_font = self.lbl_value.font()
-        val_font.setPointSize(int(val_font.pointSize() * 1.1))
-        val_font.setBold(True)
-        self.lbl_value.setFont(val_font)
-        self.lbl_value.setStyleSheet("color: #ffffff;")
-
-        unit_font = self.lbl_unit.font()
-        unit_font.setPointSize(int(unit_font.pointSize() * 1.0))
-        self.lbl_unit.setFont(unit_font)
-        self.lbl_unit.setStyleSheet("color: #ffffff;")
-
-        header.addWidget(self.lbl_value)
-        header.addWidget(self.lbl_unit)
-
-        layout.addLayout(header)
-
-        # ---- Plot ----
-        self.plot = pg.PlotWidget()
-        self.plot.setBackground("k")
-        self.plot.setMenuEnabled(False)
-        self.plot.showGrid(x=True, y=True, alpha=0.25)
-        self.plot.setLabel("bottom", "Time", units="s")
-        self.plot.setLabel("left", "Power")
-        self.plot.setXRange(-WINDOW_SECONDS, 0, padding=0.0)
-
-        axis_font = QtGui.QFont()
-        axis_font.setPointSize(9)
-        self.plot.getAxis("left").setStyle(tickFont=axis_font)
-        self.plot.getAxis("bottom").setStyle(tickFont=axis_font)
-
-        self.curve = self.plot.plot(
-            pen=pg.mkPen(self.color, width=2),
-            clipToView=True
-        )
-        try:
-            self.curve.setDownsampling(auto=True, method="peak")
-        except Exception:
-            pass
-
-        layout.addWidget(self.plot)
-
-    # --- External API ---
-
-    def set_gain_index(self, g: int):
-        if self.gain_combo is not None:
-            self.gain_combo.blockSignals(True)
-            self.gain_combo.setCurrentIndex(int(g))
-            self.gain_combo.blockSignals(False)
-
-    def update_value_W(self, p_W: float, unit_override: str | None = None):
-        if unit_override is None:
-            v_str, u_str = format_power_W(p_W)
-        else:
-            # For dB etc; we just display raw with that unit
-            if p_W is None or not np.isfinite(p_W):
-                v_str = "--"
-            else:
-                v_str = f"{p_W:,.3g}"
-            u_str = unit_override
-        self.lbl_value.setText(v_str)
-        self.lbl_unit.setText(u_str)
-
-    def update_curve(self, xs: np.ndarray, ys: np.ndarray,
-                     ymin_floor: float = 0.0):
-        self.curve.setData(xs, ys, skipFiniteCheck=True)
-
-        if ys.size == 0:
-            return
-
-        ymin = float(np.nanmin(ys))
-        ymax = float(np.nanmax(ys))
-        if not np.isfinite(ymin) or not np.isfinite(ymax):
-            return
-
-        span = ymax - ymin
-        if span <= 0:
-            span = max(1e-9, abs(ymax) * 0.2)
-
-        pad = 0.3 * span
-        lo = ymin - pad if ymin_floor is None else max(ymin_floor, ymin - pad)
-        hi = ymax + pad
-        if hi <= lo:
-            hi = lo + span if span > 0 else lo + 1e-3
-
-        self.plot.setYRange(lo, hi, padding=0)
-
-
-# ------------- Plotter tab widget -------------
 class PlotterWidget(QtWidgets.QWidget):
     """
-    Plotter tab using real CoreDAQ hardware.
+    Live plotter tab.
 
-    - 5 s moving window with UPDATE_HZ snapshots.
-    - Uses ChannelManager for:
-        * which physical channels are enabled
-        * math channels (expressions on ch1..ch4)
-        * relative transmission channels (10*log10(chX/chY))
-    - Cards are laid out in a scrollable 2-column grid.
+    Uses a shared CoreDAQ instance passed from main.
+    Does not open/close the device itself.
     """
-    def __init__(self, manager: ChannelManager, parent=None):
+
+    def __init__(self, manager: ChannelManager, daq=None, parent=None):
         super().__init__(parent)
         self.manager = manager
+        self.daq = daq
 
-        # --- CoreDAQ / live state ---
-        self.daq: CoreDAQ | None = None
-        self.autogain_enabled = False
-        self.manual_gains = [0, 0, 0, 0]
+        self.setObjectName("PlotterContainer")
 
-        # ring buffer for 4 physical channels (W)
+        # ring buffer of *physical* channels: 4 x N (W)
         self.N = max(1, SAMPLES_PER_WINDOW)
-        self.y_phys = np.zeros((4, self.N), dtype=np.float32)
-        self.y_math = np.zeros((0, self.N), dtype=np.float32)   # resized per config
-        self.y_rel = np.zeros((0, self.N), dtype=np.float32)
+        self.buf_phys = np.zeros((4, self.N), dtype=np.float32)
         self.widx = 0
         self.filled = 0
         self.tbase = np.linspace(-WINDOW_SECONDS, 0.0, self.N, dtype=np.float32)
 
-        # mapping from card index -> (kind, local_index)
-        #   kind in {"phys", "math", "rel"}
-        self.card_infos: List[Tuple[str, int]] = []
-        self.cards: List[ChannelCard] = []
+        # logical channel cards
+        self.cards: List[dict] = []
 
-        # timers
-        self._live_timer = QtCore.QTimer(self)
-        self._live_timer.timeout.connect(self._update_live)
+        # gain / autogain state
+        self.autogain_enabled = False
+        self.manual_gains = [0, 0, 0, 0]   # last manual gains per physical head
+        self.gain_combos: List[Optional[QtWidgets.QComboBox]] = [None, None, None, None]
 
-        # UI
+        # timer
+        self.timer = QtCore.QTimer(self)
+        self.timer.timeout.connect(self._update_live)
+
         self._build_ui()
-        self._rebuild_cards()
+        self.on_channels_updated()
 
-        # populate ports + connect (auto, no UI controls here)
-        self._populate_ports()
-        self._connect_current_port()
-        if self.daq is not None:
-            self.start_live()
+    # ------------------------------------------------------------------
+    # Public API called from main.py
+    # ------------------------------------------------------------------
+    def set_daq(self, daq):
+        """Inject / replace shared CoreDAQ instance."""
+        self.daq = daq
 
-    # ---------------- UI ----------------
-    def _build_ui(self):
-        main_v = QtWidgets.QVBoxLayout(self)
-        main_v.setContentsMargins(12, 12, 12, 12)
-        main_v.setSpacing(10)
+    def set_active(self, active: bool):
+        """Start/stop live polling."""
+        if active:
+            if not self.timer.isActive():
+                interval_ms = int(1000.0 / UPDATE_HZ)
+                self.timer.start(max(5, interval_ms))
+        else:
+            self.timer.stop()
 
-        # ---- Top control bar ----
-        top = QtWidgets.QWidget()
-        top_layout = QtWidgets.QHBoxLayout(top)
-        top_layout.setContentsMargins(0, 0, 0, 0)
-        top_layout.setSpacing(10)
-
- 
-
-
-        # Hidden port combo, used only for auto-detection / connection
-        self.port_combo = QtWidgets.QComboBox()
-        self.port_combo.setMinimumWidth(220)
-
-        top_layout.addStretch(1)
-
-        self.chk_autogain = QtWidgets.QCheckBox("Autogain")
-        self.chk_autogain.setToolTip("Use snapshot_autogain_W instead of manual gains")
-        top_layout.addWidget(self.chk_autogain)
-
-        main_v.addWidget(top)
-
-        # ---- Scroll area with grid of cards ----
-        self.scroll = QtWidgets.QScrollArea()
-        self.scroll.setWidgetResizable(True)
-        self.scroll.setVerticalScrollBarPolicy(QtCore.Qt.ScrollBarAsNeeded)
-        self.scroll.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarAlwaysOff)
-        self.scroll.setObjectName("PlotterScroll")
-
-        self.container = QtWidgets.QWidget()
-        self.container.setObjectName("PlotterContainer")
-
-        self.grid = QtWidgets.QGridLayout(self.container)
-        self.grid.setContentsMargins(0, 4, 0, 4)
-        self.grid.setHorizontalSpacing(10)
-        self.grid.setVerticalSpacing(10)
-
-        self.scroll.setWidget(self.container)
-        main_v.addWidget(self.scroll, 1)
-
-        # ---- Connections ----
-        self.chk_autogain.stateChanged.connect(self._on_autogain_toggled)
-
-    # ---------------- Cards / channels ----------------
-    def _rebuild_cards(self):
-        # clear grid
+    def on_channels_updated(self):
+        """Rebuild cards when channel configuration changes."""
+        # clear existing
         while self.grid.count():
             item = self.grid.takeAt(0)
             w = item.widget()
             if w is not None:
                 w.deleteLater()
         self.cards.clear()
-        self.card_infos.clear()
+        self.gain_combos = [None, None, None, None]
 
-        # rebuild math & relative buffers according to manager
-        n_math = len(self.manager.math_channels)
-        n_rel = len(self.manager.relative_channels)
-        self.y_math = np.zeros((n_math, self.N), dtype=np.float32)
-        self.y_rel = np.zeros((n_rel, self.N), dtype=np.float32)
-
-        row = 0
-        col = 0
-
-        # --- Physical channels first, in order, respecting enabled flags ---
-        for phys_idx in range(4):
-            if not self.manager.is_physical_enabled(phys_idx):
-                continue
-
-            color = COLOR_CYCLE[phys_idx % len(COLOR_CYCLE)]
-            title = f"Channel {phys_idx + 1}"
-            card = ChannelCard(
-                title=title,
-                color=color,
-                is_physical=True,
-                gain_changed_cb=self._on_gain_changed,
-                phys_index=phys_idx,
-            )
-            self.cards.append(card)
-            self.card_infos.append(("phys", phys_idx))
-            self.grid.addWidget(card, row, col)
-
-            col += 1
-            if col >= 2:
-                col = 0
-                row += 1
-
-        # --- Math channels ---
-        for math_idx, cfg in enumerate(self.manager.math_channels):
-            color = COLOR_CYCLE[(4 + math_idx) % len(COLOR_CYCLE)]
-            title = cfg.name if getattr(cfg, "name", None) else f"Math {math_idx + 1}"
-            card = ChannelCard(
-                title=title,
-                color=color,
-                is_physical=False,
-            )
-            self.cards.append(card)
-            self.card_infos.append(("math", math_idx))
-            self.grid.addWidget(card, row, col)
-            col += 1
-            if col >= 2:
-                col = 0
-                row += 1
-
-        # --- Relative channels ---
-        for rel_idx, cfg in enumerate(self.manager.relative_channels):
-            color = COLOR_CYCLE[(8 + rel_idx) % len(COLOR_CYCLE)]
-            title = cfg.name if getattr(cfg, "name", None) else f"Relative {rel_idx + 1}"
-            card = ChannelCard(
-                title=title,
-                color=color,
-                is_physical=False,
-            )
-            self.cards.append(card)
-            self.card_infos.append(("rel", rel_idx))
-            self.grid.addWidget(card, row, col)
-            col += 1
-            if col >= 2:
-                col = 0
-                row += 1
-
-        self.grid.setRowStretch(row + 1, 1)
-
-    def on_channels_updated(self):
-        """
-        Called by MainWindow when channels / math / relative configs change.
-        """
-        self._rebuild_cards()
-
-    # ---------------- COM / CoreDAQ handling ----------------
-    def _populate_ports(self):
-        self.port_combo.clear()
-        ports = []
-        try:
-            ports = CoreDAQ.find()
-        except Exception:
-            ports = []
-
-        if not ports:
-            ports = [p.device for p in serial.tools.list_ports.comports()]
-
-        if not ports:
-            ports = [DEFAULT_PORT]
-
-        for p in ports:
-            self.port_combo.addItem(p)
-
-        idx = self.port_combo.findText(DEFAULT_PORT)
-        if idx >= 0:
-            self.port_combo.setCurrentIndex(idx)
-        else:
-            self.port_combo.setCurrentIndex(0)
-
-    def _connect_current_port(self):
-        port = self.port_combo.currentText().strip()
-        if not port:
+        display_channels = self.manager.get_display_channels()
+        if not display_channels:
             return
 
-        self.stop_live()
+        axis_font = QtGui.QFont()
+        axis_font.setPointSize(8)
 
-        if self.daq is not None:
-            try:
-                self.daq.close()
-            except Exception:
-                pass
-            self.daq = None
+        colors = [
+            "#ffffff",
+            "#00E5FF",
+            "#FFD740",
+            "#69F0AE",
+            "#FF4081",
+            "#7C4DFF",
+            "#FF6E40",
+            "#64FFDA",
+        ]
 
-        try:
-            self.daq = CoreDAQ(port)
-        except Exception as e:
-            QtWidgets.QMessageBox.critical(
-                self,
-                "CoreDAQ Error",
-                f"Failed to open CoreDAQ on {port}:\n{e}"
+        for idx, cfg in enumerate(display_channels):
+            row = idx // 2
+            col = idx % 2
+
+            frame = QtWidgets.QFrame(self.inner)
+            frame.setObjectName("ChannelCard")
+            frame_layout = QtWidgets.QVBoxLayout(frame)
+            frame_layout.setContentsMargins(10, 8, 10, 10)
+            frame_layout.setSpacing(4)
+
+            # ---- header: name + value ----
+            header = QtWidgets.QHBoxLayout()
+            header.setContentsMargins(0, 0, 0, 0)
+            header.setSpacing(6)
+
+            name_label = QtWidgets.QLabel(cfg.name)
+            name_font = name_label.font()
+            name_font.setPointSize(int(name_font.pointSize() * 1.3))
+            name_font.setBold(True)
+            name_label.setFont(name_font)
+            name_label.setStyleSheet("color: #ffffff;")
+            header.addWidget(name_label)
+
+            header.addStretch(1)
+
+            value_label = QtWidgets.QLabel("0.0 W")
+            value_font = value_label.font()
+            value_font.setPointSize(int(value_font.pointSize() * 1.1))
+            value_label.setFont(value_font)
+            value_label.setStyleSheet("color: #ffffff;")
+            header.addWidget(value_label)
+
+            frame_layout.addLayout(header)
+
+            # ---- optional gain row for physical channels ----
+            gain_combo = None
+            if cfg.kind == "physical":
+                phys_idx = cfg.index or 0
+                gain_row = QtWidgets.QHBoxLayout()
+                gain_row.setContentsMargins(0, 0, 0, 0)
+                gain_row.setSpacing(6)
+
+                gain_label = QtWidgets.QLabel("Gain")
+                gain_label.setStyleSheet("color: #bbbbbb;")
+                gain_row.addWidget(gain_label)
+
+                combo = QtWidgets.QComboBox()
+                combo.setMinimumWidth(80)
+                # human-readable labels if available
+                try:
+                    from coredaq_py_api import CoreDAQ  # local import
+                    labels = getattr(CoreDAQ, "GAIN_LABELS", None)
+                except Exception:
+                    labels = None
+                if labels is not None and len(labels) >= 8:
+                    for g in range(8):
+                        combo.addItem(labels[g], g)
+                else:
+                    for g in range(8):
+                        combo.addItem(f"G{g}", g)
+                combo.setCurrentIndex(0)
+                combo.currentIndexChanged[int].connect(
+                    lambda value, idx=phys_idx: self._on_gain_changed(idx, value)
+                )
+                gain_row.addWidget(combo)
+                gain_row.addStretch(1)
+
+                frame_layout.addLayout(gain_row)
+
+                self.gain_combos[phys_idx] = combo
+
+            # ---- plot ----
+            pw = pg.PlotWidget(background="k")
+            pw.setMenuEnabled(False)
+            pw.showGrid(x=True, y=True, alpha=0.15)
+            pw.setLabel("bottom", "Time", units="s")
+            if cfg.kind == "relative":
+                pw.setLabel("left", "Relative (dB)")
+            else:
+                pw.setLabel("left", "Power", units="W")
+
+            left_axis = pw.getAxis("left")
+            bottom_axis = pw.getAxis("bottom")
+            left_axis.setStyle(tickFont=axis_font)
+            bottom_axis.setStyle(tickFont=axis_font)
+            left_axis.setPen(pg.mkPen("#bbbbbb"))
+            bottom_axis.setPen(pg.mkPen("#bbbbbb"))
+
+            color = colors[idx % len(colors)]
+            curve = pw.plot(
+                pen=pg.mkPen(color, width=2),
+                clipToView=True,
             )
-            return
 
-        try:
-            _ = self.daq.idn()
-        except Exception:
-            pass
+            frame_layout.addWidget(pw, 1)
+            self.grid.addWidget(frame, row, col)
 
-        # Oversampling = 1 for fast snapshots
-        try:
-            self.daq.set_oversampling(1)
-        except Exception:
-            pass
+            self.cards.append(
+                {
+                    "cfg": cfg,
+                    "frame": frame,
+                    "plot": pw,
+                    "curve": curve,
+                    "value_label": value_label,
+                }
+            )
 
-        # Sync gain combos from device if possible
-        try:
-            g1, g2, g3, g4 = self.daq.get_gains()
-            gains = (g1, g2, g3, g4)
-            self.manual_gains = [int(g) for g in gains]
-            for phys_idx in range(4):
-                g = gains[phys_idx]
-                for card, info in zip(self.cards, self.card_infos):
-                    if info[0] == "phys" and info[1] == phys_idx:
-                        card.set_gain_index(g)
-        except Exception:
-            self.manual_gains = [0, 0, 0, 0]
+        # allow extra stretch at bottom
+        self.grid.setRowStretch((len(display_channels) + 1) // 2 + 1, 1)
 
-        self.start_live()
+    # ------------------------------------------------------------------
+    # UI build
+    # ------------------------------------------------------------------
+    def _build_ui(self):
+        outer = QtWidgets.QVBoxLayout(self)
+        outer.setContentsMargins(8, 8, 8, 8)
+        outer.setSpacing(6)
 
-    # ---------------- Autogain / gain handling ----------------
+        # ---- top bar: title + Autogain ----
+        top_row = QtWidgets.QHBoxLayout()
+        top_row.setContentsMargins(0, 0, 0, 0)
+        top_row.setSpacing(8)
+
+        title = QtWidgets.QLabel("Plotter")
+        t_font = title.font()
+        t_font.setPointSize(int(t_font.pointSize() * 1.4))
+        t_font.setBold(True)
+        title.setFont(t_font)
+        title.setStyleSheet("color: #ffffff;")
+        top_row.addWidget(title)
+
+        top_row.addStretch(1)
+
+        self.chk_autogain = QtWidgets.QCheckBox("Autogain")
+        self.chk_autogain.setToolTip("Use snapshot_autogain_W instead of manual gains")
+        self.chk_autogain.stateChanged.connect(self._on_autogain_toggled)
+        top_row.addWidget(self.chk_autogain)
+
+        outer.addLayout(top_row)
+
+        # ---- scroll area for cards ----
+        self.scroll = QtWidgets.QScrollArea(self)
+        self.scroll.setWidgetResizable(True)
+        self.scroll.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarAlwaysOff)
+        outer.addWidget(self.scroll, 1)
+
+        self.inner = QtWidgets.QWidget()
+        self.scroll.setWidget(self.inner)
+
+        self.grid = QtWidgets.QGridLayout(self.inner)
+        self.grid.setContentsMargins(12, 12, 12, 12)
+        self.grid.setSpacing(12)
+
+    # ------------------------------------------------------------------
+    # Autogain / gain handling
+    # ------------------------------------------------------------------
     def _on_autogain_toggled(self, state: int):
-        enabled = (state == QtCore.Qt.Checked)
+        enabled = state == QtCore.Qt.Checked
         self.autogain_enabled = enabled
 
+        # enable/disable combos visually
+        for combo in self.gain_combos:
+            if combo is not None:
+                combo.setEnabled(not enabled)
+
         if enabled:
-            # Save current manual gains & disable combos
-            self.manual_gains = [0, 0, 0, 0]
-            for phys_idx in range(4):
-                self.manual_gains[phys_idx] = 0
-            for card, info in zip(self.cards, self.card_infos):
-                if info[0] == "phys" and card.gain_combo is not None:
-                    card.gain_combo.setEnabled(False)
-        else:
-            # Re-enable combos and attempt to restore manual gains to device
-            for card, info in zip(self.cards, self.card_infos):
-                if info[0] == "phys" and card.gain_combo is not None:
-                    card.gain_combo.setEnabled(True)
+            # read current gains from device as "manual" snapshot
             if self.daq is not None:
                 try:
-                    for phys_idx in range(4):
-                        g = self.manual_gains[phys_idx]
-                        self.daq.set_gain(phys_idx + 1, int(g))
+                    g1, g2, g3, g4 = self.daq.get_gains()
+                    self.manual_gains = [int(g1), int(g2), int(g3), int(g4)]
+                except Exception:
+                    # fall back to combo indices
+                    self.manual_gains = [
+                        c.currentIndex() if c is not None else 0
+                        for c in self.gain_combos
+                    ]
+        else:
+            # restore manual gains to device
+            if self.daq is not None:
+                try:
+                    for head, g in enumerate(self.manual_gains, start=1):
+                        self.daq.set_gain(head, int(g))
+                    # sync combos
+                    for i, combo in enumerate(self.gain_combos):
+                        if combo is not None:
+                            combo.blockSignals(True)
+                            combo.setCurrentIndex(int(self.manual_gains[i]))
+                            combo.blockSignals(False)
                 except Exception:
                     pass
 
-    def _on_gain_changed(self, phys_index: int, value: int):
+    def _on_gain_changed(self, phys_idx: int, value: int):
         if self.daq is None or self.autogain_enabled:
             return
         try:
-            self.daq.set_gain(phys_index + 1, int(value))
-            self.manual_gains[phys_index] = int(value)
+            self.daq.set_gain(phys_idx + 1, int(value))
+            self.manual_gains[phys_idx] = int(value)
         except Exception:
             pass
 
-    # ---------------- Live update ----------------
-    def start_live(self):
-        if self.daq is None:
-            return
-        if self._live_timer.isActive():
-            return
-        interval_ms = int(1000.0 / UPDATE_HZ)
-        self._live_timer.start(max(5, interval_ms))
-
-    def stop_live(self):
-        self._live_timer.stop()
-
-    # ---------------- Tab activation ----------------
-    def set_active(self, active: bool):
-        if active:
-            if self.daq is not None:
-                self.start_live()
-        else:
-            self.stop_live()
-
+    # ------------------------------------------------------------------
+    # Live polling
+    # ------------------------------------------------------------------
     @QtCore.pyqtSlot()
     def _update_live(self):
         if self.daq is None:
             return
 
-        # --- 1. Get physical snapshot from hardware ---
+        # ---- 1) get latest physical powers in W ----
         try:
-            if self.autogain_enabled:
+            if self.autogain_enabled and hasattr(self.daq, "snapshot_autogain_W"):
                 power_W, mv_final, gains_final = self.daq.snapshot_autogain_W(
                     n_frames=1,
                     min_mv=50.0,
@@ -538,63 +319,29 @@ class PlotterWidget(QtWidgets.QWidget):
                     max_iters=20,
                     settle_s=0.01,
                 )
-                # reflect autogain-selected gains in combos
-                for phys_idx in range(4):
-                    g = int(gains_final[phys_idx])
-                    for card, info in zip(self.cards, self.card_infos):
-                        if info[0] == "phys" and info[1] == phys_idx:
-                            card.set_gain_index(g)
+                # update combos to reflect autogain-chosen gains
+                for i, g in enumerate(gains_final):
+                    if 0 <= int(g) <= 7 and self.gain_combos[i] is not None:
+                        c = self.gain_combos[i]
+                        c.blockSignals(True)
+                        c.setCurrentIndex(int(g))
+                        c.blockSignals(False)
             else:
                 power_W = self.daq.snapshot_W(
                     n_frames=1,
                     timeout_s=0.5,
                     poll_hz=200.0,
                 )
-        except CoreDAQError:
-            return
         except Exception:
             return
 
-        power_W = np.asarray(power_W, dtype=np.float32)
-        if power_W.size < 4:
-            power_W = np.pad(power_W, (0, 4 - power_W.size))
+        phys = np.zeros(4, dtype=np.float32)
+        power_W = list(power_W)
+        for i in range(min(4, len(power_W))):
+            phys[i] = float(power_W[i])
 
-        # --- 2. Push into ring buffer for physical channels ---
-        self.y_phys[:, self.widx] = power_W[:4]
-
-        # Derived: compute new sample from physical sample
-        vars_dict = {
-            "ch1": float(power_W[0]),
-            "ch2": float(power_W[1]),
-            "ch3": float(power_W[2]),
-            "ch4": float(power_W[3]),
-        }
-
-        # Math channels (same units as W)
-        for i, cfg in enumerate(self.manager.math_channels):
-            if not cfg.expression:
-                self.y_math[i, self.widx] = np.nan
-                continue
-            try:
-                val = safe_eval_expression(cfg.expression, vars_dict)
-                self.y_math[i, self.widx] = float(val)
-            except Exception:
-                self.y_math[i, self.widx] = np.nan
-
-        # Relative channels (dB)
-        for i, cfg in enumerate(self.manager.relative_channels):
-            num_idx, den_idx = cfg.rel_src_indices
-            if not (0 <= num_idx < 4 and 0 <= den_idx < 4):
-                self.y_rel[i, self.widx] = np.nan
-                continue
-            p_num = vars_dict[f"ch{num_idx + 1}"]
-            p_den = vars_dict[f"ch{den_idx + 1}"]
-            if p_num > 0 and p_den > 0:
-                self.y_rel[i, self.widx] = 10.0 * np.log10(p_num / p_den)
-            else:
-                self.y_rel[i, self.widx] = np.nan
-
-        # ring buffer index bookkeeping
+        # ---- 2) push into ring buffer ----
+        self.buf_phys[:, self.widx] = phys
         self.widx += 1
         if self.widx >= self.N:
             self.widx = 0
@@ -609,49 +356,113 @@ class PlotterWidget(QtWidgets.QWidget):
         start = (self.widx - count) % N
         xs = self.tbase[-count:]
 
-        # helper to slice ring buffer
-        def slice_buf(buf: np.ndarray, row: int) -> np.ndarray:
-            if start + count <= N:
-                return buf[row, start:start + count]
+        if start + count <= N:
+            phys_hist = self.buf_phys[:, start:start + count]
+        else:
             first = N - start
-            return np.concatenate(
-                (buf[row, start:N], buf[row, 0:count - first]),
-                axis=0
+            phys_hist = np.concatenate(
+                (self.buf_phys[:, start:N], self.buf_phys[:, 0:count - first]),
+                axis=1,
             )
 
-        # --- 3. Update each card ---
-        for card, info in zip(self.cards, self.card_infos):
-            kind, idx = info
-            if kind == "phys":
-                ys = slice_buf(self.y_phys, idx)
-                card.update_curve(xs, ys, ymin_floor=0.0)
-                card.update_value_W(ys[-1])
-            elif kind == "math":
-                if idx < self.y_math.shape[0]:
-                    ys = slice_buf(self.y_math, idx)
-                    card.update_curve(xs, ys, ymin_floor=0.0)
-                    card.update_value_W(ys[-1])
-            elif kind == "rel":
-                if idx < self.y_rel.shape[0]:
-                    ys = slice_buf(self.y_rel, idx)
-                    # allow negative dB if present
-                    try:
-                        has_negative = np.nanmin(ys) < 0
-                    except ValueError:
-                        has_negative = False
-                    ymin_floor = None if has_negative else 0.0
-                    card.update_curve(xs, ys, ymin_floor=ymin_floor)
-                    card.update_value_W(ys[-1], unit_override="dB")
+        # ---- 3) update each logical channel card ----
+        for card in self.cards:
+            cfg: ChannelConfig = card["cfg"]
 
-    # ---------------- Cleanup ----------------
-    def closeEvent(self, ev: QtGui.QCloseEvent):
-        try:
-            self._live_timer.stop()
-        except Exception:
-            pass
-        if self.daq is not None:
-            try:
-                self.daq.close()
-            except Exception:
-                pass
-        super().closeEvent(ev)
+            if cfg.kind == "physical":
+                idx = cfg.index or 0
+                ys = phys_hist[idx, :]
+            elif cfg.kind == "math":
+                # vectorised if available
+                if hasattr(self.manager, "eval_math_array"):
+                    ys = self.manager.eval_math_array(
+                        cfg, [phys_hist[i, :] for i in range(4)]
+                    )
+                else:
+                    vals = []
+                    for k in range(count):
+                        v = self.manager.eval_math_value(
+                            cfg, [phys_hist[i, k] for i in range(4)]
+                        )
+                        vals.append(v)
+                    ys = np.asarray(vals, dtype=np.float32)
+            elif cfg.kind == "relative":
+                if hasattr(self.manager, "eval_relative_array"):
+                    ys = self.manager.eval_relative_array(
+                        cfg, [phys_hist[i, :] for i in range(4)]
+                    )
+                else:
+                    vals = []
+                    for k in range(count):
+                        v = self.manager.eval_relative_value(
+                            cfg, [phys_hist[i, k] for i in range(4)]
+                        )
+                        vals.append(v)
+                    ys = np.asarray(vals, dtype=np.float32)
+            else:
+                ys = np.zeros(count, dtype=np.float32)
+
+            ys = np.asarray(ys, dtype=np.float32)
+            if ys.shape[0] != count:
+                ys = np.resize(ys, (count,))
+
+            # update plot
+            curve = card["curve"]
+            plot = card["plot"]
+            curve.setData(xs, ys, skipFiniteCheck=True)
+
+            # update header value label
+            latest = float(ys[-1]) if ys.size else 0.0
+            txt = self._format_power_label(latest, cfg)
+            card["value_label"].setText(txt)
+
+            # y-range autoscale
+            ymin = float(np.nanmin(ys))
+            ymax = float(np.nanmax(ys))
+            if not np.isfinite(ymin) or not np.isfinite(ymax):
+                continue
+
+            span = ymax - ymin
+            if span <= 0:
+                span = max(1e-9, abs(ymax) * 0.2)
+            pad = 0.3 * span
+            lo = ymin - pad
+            hi = ymax + pad
+
+            if cfg.kind != "relative":
+                lo = max(0.0, lo)
+
+            if hi <= lo:
+                hi = lo + span if span > 0 else lo + 1e-3
+
+            plot.setYRange(lo, hi, padding=0)
+            plot.setXRange(-WINDOW_SECONDS, 0.0, padding=0)
+
+    # ------------------------------------------------------------------
+    # Helpers
+    # ------------------------------------------------------------------
+    def _format_power_label(self, value_W: float, cfg: ChannelConfig) -> str:
+        """Return human-friendly power / dB label."""
+        if cfg.kind == "relative":
+            if not np.isfinite(value_W):
+                return "— dB"
+            return f"{value_W:.2f} dB"
+
+        # power
+        v = abs(value_W)
+        unit = "W"
+        scale = 1.0
+        if v < 1e-9:
+            unit = "W"
+            scale = 1.0
+        elif v < 1e-6:
+            unit = "nW"
+            scale = 1e9
+        elif v < 1e-3:
+            unit = "µW"
+            scale = 1e6
+        elif v < 1.0:
+            unit = "mW"
+            scale = 1e3
+
+        return f"{value_W * scale:,.3g} {unit}"
