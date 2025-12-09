@@ -1,228 +1,223 @@
 # channels.py
+from __future__ import annotations
+
 from dataclasses import dataclass
-from typing import Optional, Tuple, List
-import ast
-import operator as op
+from typing import List, Optional, Tuple, Dict, Any, Iterable
 
-from PyQt5 import QtWidgets, QtCore
+import numpy as np
+from PyQt5 import QtCore, QtWidgets
 
-# ------------------------------------------------------------
-# Channel definition + manager
-# ------------------------------------------------------------
+
+# -------------------------------------------------------------------
+# Channel config dataclass
+# -------------------------------------------------------------------
 
 @dataclass
 class ChannelConfig:
     """
-    Unified channel description.
+    Generic channel configuration.
 
     kind:
-        "physical"  - direct CoreDAQ channel
-        "math"      - expression based on ch1..ch4
-        "relative"  - 10*log10(Pa/Pb) between two physical channels
+      - "physical"   -> direct CoreDAQ channel (index 0..3)
+      - "math"       -> math expression based on ch1..ch4
+      - "relative"   -> 10*log10(ch_num/ch_den) in dB
     """
     name: str
-    kind: str  # "physical" | "math" | "relative"
-    unit: str = ""
-    physical_index: Optional[int] = None               # 0..3 for physical
-    expression: Optional[str] = None                   # for math channels
-    rel_src_indices: Optional[Tuple[int, int]] = None  # (num_idx, den_idx)
+    kind: str  # "physical", "math", "relative"
+    unit: str = "W"
+    index: Optional[int] = None                  # for physical channels: 0..3
+    expression: Optional[str] = None             # for math channels
+    rel_src_indices: Optional[Tuple[int, int]] = None  # (num, den) for relative
+    enabled: bool = True                         # for physical channels
 
 
-class ChannelManager:
-    """
-    Global channel registry shared between all tabs.
-    """
-    def __init__(self):
-        self.enabled_physical: List[bool] = [True, True, True, True]
-        self.math_channels: List[ChannelConfig] = []
-        self.relative_channels: List[ChannelConfig] = []
+# -------------------------------------------------------------------
+# Safe expression evaluation for math channels
+# -------------------------------------------------------------------
 
-    # ---- physical channels ----
-    def set_physical_enabled(self, index: int, enabled: bool):
-        if 0 <= index < 4:
-            self.enabled_physical[index] = bool(enabled)
-
-    def is_physical_enabled(self, index: int) -> bool:
-        if 0 <= index < 4:
-            return self.enabled_physical[index]
-        return False
-
-    # ---- math channels ----
-    def add_math_channel(self, cfg: ChannelConfig):
-        if cfg.kind != "math":
-            raise ValueError("ChannelConfig.kind must be 'math' for math channels")
-        self.math_channels.append(cfg)
-
-    # ---- relative channels ----
-    def add_relative_channel(self, cfg: ChannelConfig):
-        if cfg.kind != "relative":
-            raise ValueError("ChannelConfig.kind must be 'relative' for relative channels")
-        self.relative_channels.append(cfg)
-
-    # ---- active channel list ----
-    def get_active_channel_configs(self) -> List[ChannelConfig]:
-        """
-        Return all *enabled* physical channels + all math + all relative.
-        """
-        configs: List[ChannelConfig] = []
-
-        # Physical
-        for i in range(4):
-            if self.enabled_physical[i]:
-                configs.append(
-                    ChannelConfig(
-                        name=f"Channel {i + 1}",
-                        kind="physical",
-                        unit="W",
-                        physical_index=i,
-                    )
-                )
-
-        # Math and relative: as stored
-        configs.extend(self.math_channels)
-        configs.extend(self.relative_channels)
-        return configs
-
-
-# ------------------------------------------------------------
-# Expression + formatting helpers shared by tabs
-# ------------------------------------------------------------
-
-_ALLOWED_OPS = {
-    ast.Add: op.add,
-    ast.Sub: op.sub,
-    ast.Mult: op.mul,
-    ast.Div: op.truediv,
-    ast.Pow: op.pow,
-    ast.Mod: op.mod,
-    ast.USub: op.neg,
-    ast.UAdd: op.pos,
+_SAFE_FUNCS: Dict[str, Any] = {
+    "abs": np.abs,
+    "sin": np.sin,
+    "cos": np.cos,
+    "tan": np.tan,
+    "exp": np.exp,
+    "log": np.log,
+    "log10": np.log10,
+    "sqrt": np.sqrt,
+    "maximum": np.maximum,
+    "minimum": np.minimum,
 }
 
 
-def safe_eval_expression(expr: str, variables: dict):
+def safe_eval_expression(expr: str, context: Dict[str, Any]) -> Any:
     """
-    Safely evaluate an arithmetic expression using ch1..ch4 etc.
+    Very small wrapper around eval with a restricted namespace.
 
-    Allowed:
-        - Numbers
-        - Variables in `variables`, e.g. 'ch1', 'ch2'
-        - +, -, *, /, **, %, unary +/- and parentheses
-
-    Works with scalars OR numpy arrays.
-
-    Raises ValueError on invalid expressions.
+    'context' typically contains:
+        ch1, ch2, ch3, ch4 : scalars or numpy arrays (in W)
     """
-    expr = expr.strip()
-    if not expr:
-        raise ValueError("Empty expression")
-    if len(expr) > 80:
-        raise ValueError("Expression too long")
-
-    node = ast.parse(expr, mode="eval")
-
-    def _eval(n):
-        if isinstance(n, ast.Expression):
-            return _eval(n.body)
-        if isinstance(n, ast.Constant):
-            if isinstance(n.value, (int, float)):
-                return n.value
-            raise ValueError("Only int/float constants allowed")
-        if isinstance(n, ast.Num):  # py<3.8
-            return n.n
-        if isinstance(n, ast.BinOp) and type(n.op) in _ALLOWED_OPS:
-            return _ALLOWED_OPS[type(n.op)](_eval(n.left), _eval(n.right))
-        if isinstance(n, ast.UnaryOp) and type(n.op) in _ALLOWED_OPS:
-            return _ALLOWED_OPS[type(n.op)](_eval(n.operand))
-        if isinstance(n, ast.Name):
-            if n.id in variables:
-                return variables[n.id]
-            raise ValueError(f"Unknown variable '{n.id}'")
-        raise ValueError("Unsupported expression")
-
-    return _eval(node)
+    allowed = dict(_SAFE_FUNCS)
+    allowed.update(context)
+    return eval(expr, {"__builtins__": {}}, allowed)
 
 
-def format_power_auto(value_w: float):
+# -------------------------------------------------------------------
+# Channel manager
+# -------------------------------------------------------------------
+
+class ChannelManager:
     """
-    Format a power value (in watts) into a sensible engineering unit
-    (W, mW, µW, nW, pW) and return (string, unit).
+    Holds physical, math and relative channels and their enabled state.
     """
-    if value_w is None:
-        return "—", "W"
 
-    v = float(value_w)
-    av = abs(v)
+    def __init__(self) -> None:
+        # 4 physical channels by default
+        self.physical_channels: List[ChannelConfig] = [
+            ChannelConfig(
+                name=f"Channel {i+1}",
+                kind="physical",
+                unit="W",
+                index=i,
+                enabled=True,
+            )
+            for i in range(4)
+        ]
 
-    if av >= 1.0 or av == 0.0:
-        return f"{v:.3g}", "W"
-    elif av >= 1e-3:
-        return f"{v * 1e3:.3g}", "mW"
-    elif av >= 1e-6:
-        return f"{v * 1e6:.3g}", "µW"
-    elif av >= 1e-9:
-        return f"{v * 1e9:.3g}", "nW"
-    else:
-        return f"{v * 1e12:.3g}", "pW"
+        self.math_channels: List[ChannelConfig] = []
+        self.relative_channels: List[ChannelConfig] = []
+
+    # --- Physical enable/disable ---
+
+    def is_physical_enabled(self, idx: int) -> bool:
+        if 0 <= idx < len(self.physical_channels):
+            return self.physical_channels[idx].enabled
+        return False
+
+    def set_physical_enabled(self, idx: int, enabled: bool) -> None:
+        if 0 <= idx < len(self.physical_channels):
+            self.physical_channels[idx].enabled = enabled
+
+    # --- Add math / relative ---
+
+    def add_math_channel(self, cfg: ChannelConfig) -> None:
+        cfg.kind = "math"
+        self.math_channels.append(cfg)
+
+    def add_relative_channel(self, cfg: ChannelConfig) -> None:
+        cfg.kind = "relative"
+        self.relative_channels.append(cfg)
+
+    # --- For UI / plotting ---
+
+    def get_display_channels(self) -> List[ChannelConfig]:
+        """
+        Order: enabled physical channels, then math, then relative.
+        """
+        chs: List[ChannelConfig] = [
+            c for c in self.physical_channels if c.enabled
+        ]
+        chs.extend(self.math_channels)
+        chs.extend(self.relative_channels)
+        return chs
+
+    # --- Evaluation helpers (scalar) ---
+
+    def eval_math_scalar(self, cfg: ChannelConfig, phys_values_W: Iterable[float]) -> float:
+        """
+        Evaluate math expression on current scalar physical values in W.
+        phys_values_W: length-4 iterable [ch1_W, ch2_W, ch3_W, ch4_W]
+        """
+        ch1, ch2, ch3, ch4 = phys_values_W
+        context = {
+            "ch1": ch1,
+            "ch2": ch2,
+            "ch3": ch3,
+            "ch4": ch4,
+        }
+        return float(safe_eval_expression(cfg.expression or "0", context))
+
+    def eval_relative_scalar(self, cfg: ChannelConfig, phys_values_W: Iterable[float]) -> float:
+        """
+        10*log10(ch_num/ch_den) with some safety.
+        """
+        ch1, ch2, ch3, ch4 = phys_values_W
+        arr = [ch1, ch2, ch3, ch4]
+        num_idx, den_idx = cfg.rel_src_indices or (0, 1)
+        num = float(arr[num_idx])
+        den = float(arr[den_idx])
+        if den <= 0 or num <= 0:
+            # effectively -inf, but clamp for display
+            return float("-inf")
+        return 10.0 * np.log10(num / den)
+
+    # --- Evaluation helpers (array) ---
+
+    def eval_math_array(self, cfg: ChannelConfig, phys_arrays_W: List[np.ndarray]) -> np.ndarray:
+        """
+        Evaluate math expression on arrays for sweep plots.
+        phys_arrays_W: [ch1_array, ch2_array, ch3_array, ch4_array] in W
+        """
+        ch1, ch2, ch3, ch4 = phys_arrays_W
+        context = {
+            "ch1": ch1,
+            "ch2": ch2,
+            "ch3": ch3,
+            "ch4": ch4,
+        }
+        return np.asarray(safe_eval_expression(cfg.expression or "0", context))
+
+    def eval_relative_array(self, cfg: ChannelConfig, phys_arrays_W: List[np.ndarray]) -> np.ndarray:
+        """
+        Relative transmission in dB on arrays for sweep plots.
+        """
+        ch1, ch2, ch3, ch4 = phys_arrays_W
+        num_idx, den_idx = cfg.rel_src_indices or (0, 1)
+        num = np.asarray([ch1, ch2, ch3, ch4][num_idx])
+        den = np.asarray([ch1, ch2, ch3, ch4][den_idx])
+        num = np.maximum(num, 1e-20)
+        den = np.maximum(den, 1e-20)
+        return 10.0 * np.log10(num / den)
 
 
-# High-contrast color cycle for curves
-COLOR_CYCLE = [
-    "#f5f5f5",  # near-white
-    "#ff5252",  # red
-    "#40c4ff",  # cyan
-    "#ffc400",  # amber
-    "#b39ddb",  # soft violet
-    "#69f0ae",  # mint
-    "#ff9e80",  # orange
-    "#8e24aa",  # purple
-]
-
-
-# ------------------------------------------------------------
-# Dialogs for creating math and relative channels
-# ------------------------------------------------------------
+# -------------------------------------------------------------------
+# Math channel dialog
+# -------------------------------------------------------------------
 
 class MathChannelDialog(QtWidgets.QDialog):
     """
-    Dialog to define a math channel:
-      - Name
-      - Expression in terms of ch1..ch4
+    Simple dialog for creating/editing a math channel.
+    User enters:
+      - Name (optional)
+      - Expression (required), e.g. "ch1 - ch2" or "10*log10(ch1/ch2)"
       - Unit (optional)
-    Produces a ChannelConfig(kind="math", expression=..., unit=...).
     """
+
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setWindowTitle("Add Math Channel")
-        self.setModal(True)
-        self.config: Optional[ChannelConfig] = None
 
-        layout = QtWidgets.QVBoxLayout(self)
-        layout.setContentsMargins(12, 12, 12, 12)
-        layout.setSpacing(8)
+        self.channel_name: str = ""
+        self.expression: str = ""
+        self.unit: str = ""
 
-        form = QtWidgets.QFormLayout()
-        form.setLabelAlignment(QtCore.Qt.AlignRight | QtCore.Qt.AlignVCenter)
+        layout = QtWidgets.QFormLayout(self)
 
-        self.le_name = QtWidgets.QLineEdit(self)
-        self.le_name.setPlaceholderText("e.g. CH1 - CH2")
-        form.addRow("Name:", self.le_name)
+        self.name_edit = QtWidgets.QLineEdit(self)
+        self.expr_edit = QtWidgets.QLineEdit(self)
+        self.unit_edit = QtWidgets.QLineEdit(self)
 
-        self.le_expr = QtWidgets.QLineEdit(self)
-        self.le_expr.setPlaceholderText("Expression in ch1..ch4, e.g. (ch1 - ch2) / ch2")
-        form.addRow("Expression:", self.le_expr)
+        self.expr_edit.setPlaceholderText("e.g. ch1 - ch2 or 10*log10(ch1/ch2)")
 
-        self.le_unit = QtWidgets.QLineEdit(self)
-        self.le_unit.setPlaceholderText("Optional, e.g. W, mW, dB")
-        form.addRow("Unit:", self.le_unit)
+        layout.addRow("Name:", self.name_edit)
+        layout.addRow("Expression:", self.expr_edit)
+        layout.addRow("Unit:", self.unit_edit)
 
-        layout.addLayout(form)
-
-        hint = QtWidgets.QLabel(
-            "Allowed: numbers, variables ch1..ch4, and + - * / ** % with parentheses."
+        help_label = QtWidgets.QLabel(
+            "Variables: ch1, ch2, ch3, ch4 (in W)\n"
+            "Functions: sin, cos, exp, log, log10, sqrt, maximum, minimum, abs"
         )
-        hint.setWordWrap(True)
-        layout.addWidget(hint)
+        help_label.setWordWrap(True)
+        layout.addRow(help_label)
 
         btn_box = QtWidgets.QDialogButtonBox(
             QtWidgets.QDialogButtonBox.Ok | QtWidgets.QDialogButtonBox.Cancel,
@@ -231,93 +226,61 @@ class MathChannelDialog(QtWidgets.QDialog):
         )
         btn_box.accepted.connect(self._on_accept)
         btn_box.rejected.connect(self.reject)
-        layout.addWidget(btn_box)
+        layout.addRow(btn_box)
 
     def _on_accept(self):
-        name = self.le_name.text().strip()
-        expr = self.le_expr.text().strip()
-        unit = self.le_unit.text().strip()
-
-        if not expr:
+        self.channel_name = self.name_edit.text().strip()
+        self.expression = self.expr_edit.text().strip()
+        self.unit = self.unit_edit.text().strip()
+        if not self.expression:
             QtWidgets.QMessageBox.warning(
                 self,
                 "Invalid expression",
-                "Please enter a valid expression in terms of ch1..ch4.",
+                "Expression cannot be empty.",
             )
             return
-
-        # Try a dry-run parse to provide early feedback
-        try:
-            _ = safe_eval_expression(
-                expr,
-                {"ch1": 1.0, "ch2": 1.0, "ch3": 1.0, "ch4": 1.0},
-            )
-        except Exception as e:
-            QtWidgets.QMessageBox.warning(
-                self,
-                "Invalid expression",
-                f"Expression could not be parsed:\n{e}",
-            )
-            return
-
-        if not name:
-            name = f"Math ({expr})"
-
-        cfg = ChannelConfig(
-            name=name,
-            kind="math",
-            unit=unit,
-            expression=expr,
-        )
-        self.config = cfg
         self.accept()
 
-    def get_config(self) -> Optional[ChannelConfig]:
-        return self.config
 
+# -------------------------------------------------------------------
+# Relative transmission dialog
+# -------------------------------------------------------------------
 
 class RelativeTransmissionDialog(QtWidgets.QDialog):
     """
-    Dialog to define a relative transmission channel:
-      - Name
-      - Numerator physical channel (1..4)
-      - Denominator physical channel (1..4)
-    Produces a ChannelConfig(kind="relative", unit="dB",
-    rel_src_indices=(num_idx, den_idx)).
+    Dialog to define a relative transmission channel of the form:
+        10 * log10(Ch_num / Ch_den)
     """
+
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setWindowTitle("Add Relative Transmission Channel")
-        self.setModal(True)
-        self.config: Optional[ChannelConfig] = None
 
-        layout = QtWidgets.QVBoxLayout(self)
-        layout.setContentsMargins(12, 12, 12, 12)
-        layout.setSpacing(8)
+        self.channel_name: str = ""
+        self.numerator_index: int = 0
+        self.denominator_index: int = 1
 
-        form = QtWidgets.QFormLayout()
-        form.setLabelAlignment(QtCore.Qt.AlignRight | QtCore.Qt.AlignVCenter)
+        layout = QtWidgets.QFormLayout(self)
 
-        self.le_name = QtWidgets.QLineEdit(self)
-        self.le_name.setPlaceholderText("e.g. CH1 / CH2 (dB)")
-        form.addRow("Name:", self.le_name)
+        self.name_edit = QtWidgets.QLineEdit(self)
 
-        self.cb_num = QtWidgets.QComboBox(self)
-        self.cb_den = QtWidgets.QComboBox(self)
+        self.num_combo = QtWidgets.QComboBox(self)
+        self.den_combo = QtWidgets.QComboBox(self)
+
+        # We assume 4 physical channels (1..4)
         for i in range(4):
-            label = f"Channel {i + 1}"
-            self.cb_num.addItem(label, i)
-            self.cb_den.addItem(label, i)
-        form.addRow("Numerator:", self.cb_num)
-        form.addRow("Denominator:", self.cb_den)
+            self.num_combo.addItem(f"Channel {i+1}", i)
+            self.den_combo.addItem(f"Channel {i+1}", i)
 
-        layout.addLayout(form)
+        self.num_combo.setCurrentIndex(0)
+        self.den_combo.setCurrentIndex(1)
 
-        hint = QtWidgets.QLabel(
-            "Computes 10·log10(P_num / P_den) based on physical channels."
-        )
-        hint.setWordWrap(True)
-        layout.addWidget(hint)
+        layout.addRow("Name:", self.name_edit)
+        layout.addRow("Numerator:", self.num_combo)
+        layout.addRow("Denominator:", self.den_combo)
+
+        info = QtWidgets.QLabel("Result = 10·log10( Numerator / Denominator ) in dB")
+        layout.addRow(info)
 
         btn_box = QtWidgets.QDialogButtonBox(
             QtWidgets.QDialogButtonBox.Ok | QtWidgets.QDialogButtonBox.Cancel,
@@ -326,14 +289,16 @@ class RelativeTransmissionDialog(QtWidgets.QDialog):
         )
         btn_box.accepted.connect(self._on_accept)
         btn_box.rejected.connect(self.reject)
-        layout.addWidget(btn_box)
+        layout.addRow(btn_box)
 
     def _on_accept(self):
-        name = self.le_name.text().strip()
-        num_idx = int(self.cb_num.currentData())
-        den_idx = int(self.cb_den.currentData())
+        name = self.name_edit.text().strip()
+        self.channel_name = name
 
-        if num_idx == den_idx:
+        self.numerator_index = int(self.num_combo.currentData())
+        self.denominator_index = int(self.den_combo.currentData())
+
+        if self.numerator_index == self.denominator_index:
             QtWidgets.QMessageBox.warning(
                 self,
                 "Invalid selection",
@@ -341,17 +306,4 @@ class RelativeTransmissionDialog(QtWidgets.QDialog):
             )
             return
 
-        if not name:
-            name = f"Rel CH{num_idx + 1}/CH{den_idx + 1} (dB)"
-
-        cfg = ChannelConfig(
-            name=name,
-            kind="relative",
-            unit="dB",
-            rel_src_indices=(num_idx, den_idx),
-        )
-        self.config = cfg
         self.accept()
-
-    def get_config(self) -> Optional[ChannelConfig]:
-        return self.config
