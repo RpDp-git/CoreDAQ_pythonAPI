@@ -1,180 +1,50 @@
 # sweep_tab.py
 
-import time
-from typing import Dict, Any, List, Optional
+from __future__ import annotations
 
+from typing import Optional, List, Dict, Any
+
+import time
 import numpy as np
 from PyQt5 import QtCore, QtGui, QtWidgets
 import pyqtgraph as pg
 
-from coredaq_py_api import CoreDAQ, CoreDAQError
-from laser.TSL550 import TSL550
-from laser.TSL570 import TSL570
-from laser.TSL770 import TSL770
-from channels import ChannelManager, safe_eval_expression
+from channels import ChannelManager, ChannelConfig
+from coredaq_py_api import CoreDAQError, CoreDAQ
 
+# -------------------- pyqtgraph config --------------------
+pg.setConfigOptions(antialias=False)
 
-# -------------------- Defaults --------------------
+# -------------------- Laser defaults --------------------
 DEFAULT_START_NM = 1480.0
 DEFAULT_STOP_NM = 1620.0
 DEFAULT_POWER_MW = 1.0
 DEFAULT_SPEED_NM_S = 50.0
 DEFAULT_SAMPLE_RATE = 50_000  # Hz
-DEFAULT_DAQ_PORT = "COM4"     # fallback if auto-detect fails
 DEFAULT_GPIB_ADDR = 1
+DEFAULT_LASER_MODEL = "TSL770"
 
-# Order matters: first entry is the default
-LASER_MODELS = ["TSL 770", "TSL 570", "TSL 550"]
+# -------------------- Laser model imports --------------------
+try:
+    from laser.TSL550 import TSL550
+except Exception:  # pragma: no cover
+    TSL550 = None  # type: ignore
 
+try:
+    from laser.TSL570 import TSL570
+except Exception:  # pragma: no cover
+    TSL570 = None  # type: ignore
 
-# -------------------- SWEEP BACKEND --------------------
-def perform_sweep_logic(
-    start_nm: float,
-    stop_nm: float,
-    power_mw: float,
-    speed_nm_s: float,
-    sample_rate: float,
-    daq_port: str,
-    gpib_addr: int,
-    laser_model: str,
-) -> (np.ndarray, List[np.ndarray], Dict[str, Optional[float]]):
-    """
-    Actual CoreDAQ + laser control.
+try:
+    from laser.TSL770 import TSL770  # adjust to your actual filename
+except Exception:  # pragma: no cover
+    TSL770 = None  # type: ignore
 
-    Args:
-        start_nm:    sweep start wavelength (nm)
-        stop_nm:     sweep stop wavelength (nm)
-        power_mw:    laser power (mW)
-        speed_nm_s:  sweep speed (nm/s)
-        sample_rate: DAQ sample rate (Hz)
-        daq_port:    serial/USB port where CoreDAQ is connected
-        gpib_addr:   GPIB address of the laser
-        laser_model: label from LASER_MODELS
-
-    Returns:
-        wavelengths: np.ndarray of shape (N,) in nm
-        channels_W:  list of 4 np.ndarray, each shape (N,), power in W
-        env:         dict with keys:
-                     "die_temp_C", "head_temp_C", "humidity_RH"
-    """
-
-    daq = None
-    laser = None
-    env = {
-        "die_temp_C": None,
-        "head_temp_C": None,
-        "humidity_RH": None,
-    }
-
-    try:
-        # -------- Laser setup --------
-        if laser_model == "TSL 550":
-            LaserClass = TSL550
-        elif laser_model == "TSL 570":
-            LaserClass = TSL570
-        else:
-            # Fallback / default
-            LaserClass = TSL770
-
-        laser = LaserClass(gpip_address=gpib_addr)
-        laser.connect()
-
-        laser.set_wave_unit(0)       # 0 = nm
-        laser.set_pow_unit(1)        # 1 = mW
-        laser.set_trigger_in(0)
-        laser.set_sweep_cycles(1)
-        laser.set_trig_out_mode(2)
-        laser.set_sweep_speed(speed_nm_s)
-        laser.set_pow_max(20.0)
-        laser.set_power(power_mw)
-        laser.set_wavelength(start_nm)
-        laser.set_sweep_settings(
-            start_lim=start_nm,
-            end_lim=stop_nm,
-            mode=1,      # CW sweep
-            dwel_time=0,
-        )
-
-        laser.input_check = True
-
-        # -------- DAQ setup --------
-        daq = CoreDAQ(daq_port)
-        daq.set_oversampling(1)
-        daq.set_freq(sample_rate)
-
-        # Gains are assumed to be set elsewhere (plotter/global UI)
-
-        # -------- Sweep / acquisition timing --------
-        sweep_span = stop_nm - start_nm
-        if speed_nm_s <= 0:
-            raise ValueError("Sweep speed must be > 0 nm/s")
-
-        sweep_duration_s = abs(sweep_span) / speed_nm_s
-        sweep_duration_s = max(sweep_duration_s, 1e-9)
-        samples_total = int(max(1, round(sweep_duration_s * sample_rate)))
-
-        print("Samples to Acquire:", samples_total)
-
-        daq.trig_arm(samples_total)
-        time.sleep(1.0)  # small setup delay
-
-        print("Starting sweep and acquisition...")
-        start_time = time.time()
-
-        # Start wavelength sweep
-        laser.set_sweep_start()
-
-        # Wait for CoreDAQ to finish
-        while not daq.is_data_ready():
-            time.sleep(0.1)
-
-        end_time = time.time()
-        print(f"Acquired {samples_total} samples in {end_time - start_time:.2f} s")
-
-        # -------- Retrieve data (in W) --------
-        time.sleep(0.5)  # small delay for transfer stability
-        channels_W = daq.transfer_frames_W(samples_total)  # list of 4 arrays
-
-        # -------- Build wavelength axis --------
-        t = np.arange(samples_total, dtype=float) / float(sample_rate)
-        wavelengths = start_nm + sweep_span * (t / sweep_duration_s)
-        wavelengths = np.clip(
-            wavelengths,
-            min(start_nm, stop_nm),
-            max(start_nm, stop_nm),
-        )
-
-        # -------- Environment / temperatures --------
-        try:
-            env["die_temp_C"] = daq.get_die_temperature_C()
-        except Exception:
-            pass
-
-        try:
-            env["head_temp_C"] = daq.get_head_temperature_C()
-        except Exception:
-            pass
-
-        try:
-            env["humidity_RH"] = daq.get_head_humidity()
-        except Exception:
-            pass
-
-        return wavelengths, channels_W, env
-
-    finally:
-        # Clean up hardware
-        try:
-            if daq is not None:
-                daq.close()
-        except Exception:
-            pass
-
-        try:
-            if laser is not None:
-                laser.close()
-        except Exception:
-            pass
+LASER_MODELS = {
+    "TSL550": TSL550,
+    "TSL570": TSL570,
+    "TSL770": TSL770,
+}
 
 
 # -------------------- Worker for sweep (runs in QThread) --------------------
@@ -182,42 +52,138 @@ class SweepWorker(QtCore.QObject):
     finished = QtCore.pyqtSignal()
     error = QtCore.pyqtSignal(str)
     status = QtCore.pyqtSignal(str)
-    result = QtCore.pyqtSignal(object, object, object)  # (wavelengths, channels_W, env)
+    result = QtCore.pyqtSignal(object, object)  # (wavelengths, channels_W)
 
-    def __init__(self, params: Dict[str, Any], parent=None):
+    def __init__(self, params: Dict[str, Any], daq, parent=None):
         super().__init__(parent)
         self.params = params
+        self.daq = daq  # shared CoreDAQ instance (do NOT close here)
 
     @QtCore.pyqtSlot()
     def run(self):
         p = self.params
+        daq = self.daq
+
+        if daq is None:
+            self.error.emit("No CoreDAQ device connected.")
+            self.finished.emit()
+            return
+
         try:
-            self.status.emit("Starting sweep backend…")
+            laser_model = p.get("laser_model", DEFAULT_LASER_MODEL)
+            LaserClass = LASER_MODELS.get(laser_model, None)
+            if LaserClass is None:
+                raise RuntimeError(
+                    f"Laser model '{laser_model}' is not available. "
+                    f"Please ensure its driver is installed."
+                )
 
-            start_nm = p["start_nm"]
-            stop_nm = p["stop_nm"]
-            power_mw = p["power_mw"]
-            speed_nm_s = p["speed_nm_s"]
-            sample_rate = p["sample_rate"]
+            start_nm = float(p["start_nm"])
+            stop_nm = float(p["stop_nm"])
+            power_mw = float(p["power_mw"])
+            speed_nm_s = float(p["speed_nm_s"])
+            sample_rate = int(p["sample_rate"])
             gpib_addr = int(p["gpib_addr"])
-            laser_model = p.get("laser_model", LASER_MODELS[0])
-            daq_port = p["daq_port"]
 
-            t0 = time.time()
-            wavelengths, channels_W, env = perform_sweep_logic(
-                start_nm=start_nm,
-                stop_nm=stop_nm,
-                power_mw=power_mw,
-                speed_nm_s=speed_nm_s,
-                sample_rate=sample_rate,
-                daq_port=daq_port,
-                gpib_addr=gpib_addr,
-                laser_model=laser_model,
-            )
-            t1 = time.time()
-            self.status.emit(f"Sweep backend finished in {t1 - t0:.2f} s")
+            gain_ch1 = int(p.get("gain_ch1", 0))
+            gain_ch2 = int(p.get("gain_ch2", 0))
+            gain_ch3 = int(p.get("gain_ch3", 0))
+            gain_ch4 = int(p.get("gain_ch4", 0))
+            gains = [gain_ch1, gain_ch2, gain_ch3, gain_ch4]
 
-            self.result.emit(wavelengths, channels_W, env)
+            self.status.emit("Configuring laser…")
+
+            laser = None
+            try:
+                # ----- Laser setup -----
+                laser = LaserClass(gpip_address=gpib_addr)
+                laser.connect()
+
+                laser.set_wave_unit(0)  # nm
+                laser.set_pow_unit(1)   # mW
+                laser.set_trigger_in(0)
+                laser.set_sweep_cycles(1)
+                laser.set_trig_out_mode(2)
+                laser.set_sweep_speed(speed_nm_s)
+                laser.set_pow_max(20.0)
+                laser.set_power(power_mw)
+                laser.set_wavelength(start_nm)
+                laser.set_sweep_settings(
+                    start_lim=start_nm,
+                    end_lim=stop_nm,
+                    mode=1,      # CW sweep
+                    dwel_time=0,
+                )
+                laser.input_check = True
+
+                # ----- CoreDAQ setup -----
+                self.status.emit("Configuring CoreDAQ…")
+                try:
+                    daq.set_oversampling(1)
+                except Exception:
+                    pass
+                try:
+                    daq.set_freq(sample_rate)
+                except Exception:
+                    pass
+
+                # Apply user-selected gains
+                for head, g in enumerate(gains, start=1):
+                    try:
+                        daq.set_gain(head, g)
+                    except Exception:
+                        pass
+
+                # ----- Sweep timing -----
+                sweep_span = stop_nm - start_nm
+                if speed_nm_s <= 0:
+                    raise ValueError("Sweep speed must be > 0 nm/s")
+
+                sweep_duration_s = abs(sweep_span) / speed_nm_s
+                samples_total = int(max(1, round(sweep_duration_s * sample_rate)))
+
+                self.status.emit(f"Samples to acquire: {samples_total}")
+                daq.trig_arm(samples_total)
+                time.sleep(1.0)
+
+                self.status.emit("Starting sweep and acquisition…")
+                start_time = time.time()
+
+                laser.set_sweep_start()
+
+                while not daq.is_data_ready():
+                    time.sleep(0.1)
+
+                end_time = time.time()
+                self.status.emit(
+                    f"Acquired {samples_total} samples in {end_time - start_time:.2f} s"
+                )
+
+                # ----- Retrieve data (in W) -----
+                time.sleep(0.5)
+                try:
+                    channels_W = daq.transfer_frames_W(samples_total)
+                except CoreDAQError as e:
+                    raise RuntimeError(f"CoreDAQ transfer error: {e}")
+
+                # ----- Build wavelength axis -----
+                t = np.arange(samples_total, dtype=float) / float(sample_rate)
+                wavelengths = start_nm + sweep_span * (t / sweep_duration_s)
+                wavelengths = np.clip(
+                    wavelengths,
+                    min(start_nm, stop_nm),
+                    max(start_nm, stop_nm),
+                )
+
+                self.result.emit(wavelengths, channels_W)
+
+            finally:
+                try:
+                    if laser is not None:
+                        laser.close()
+                except Exception:
+                    pass
+
         except Exception as e:
             self.error.emit(str(e))
         finally:
@@ -254,18 +220,19 @@ class SweepParamsDialog(QtWidgets.QDialog):
             "Sample rate (Hz)", "sample_rate", int_validator
         )
 
-        # GPIB address
         self.le_gpib = add_line("GPIB address", "gpib_addr", int_validator)
 
-        # Laser model dropdown
-        self.cmb_laser = QtWidgets.QComboBox(self)
-        self.cmb_laser.addItems(LASER_MODELS)
-        current_model = str(self._params.get("laser_model", LASER_MODELS[0]))
-        idx = self.cmb_laser.findText(current_model)
+        # Laser model combo
+        self.laser_combo = QtWidgets.QComboBox(self)
+        for name in ["TSL550", "TSL570", "TSL770"]:
+            self.laser_combo.addItem(name, name)
+        current_model = self._params.get("laser_model", DEFAULT_LASER_MODEL)
+        idx = self.laser_combo.findData(current_model)
         if idx < 0:
-            idx = 0
-        self.cmb_laser.setCurrentIndex(idx)
-        form.addRow("Laser model", self.cmb_laser)
+            idx = self.laser_combo.findData(DEFAULT_LASER_MODEL)
+        if idx >= 0:
+            self.laser_combo.setCurrentIndex(idx)
+        form.addRow("Laser model", self.laser_combo)
 
         btn_box = QtWidgets.QDialogButtonBox(
             QtWidgets.QDialogButtonBox.Ok | QtWidgets.QDialogButtonBox.Cancel,
@@ -288,7 +255,9 @@ class SweepParamsDialog(QtWidgets.QDialog):
 
             self._params["sample_rate"] = int(self.le_sample_rate.text())
             self._params["gpib_addr"] = int(self.le_gpib.text())
-            self._params["laser_model"] = self.cmb_laser.currentText()
+
+            model = self.laser_combo.currentData()
+            self._params["laser_model"] = model
         except ValueError:
             QtWidgets.QMessageBox.warning(
                 self,
@@ -299,21 +268,27 @@ class SweepParamsDialog(QtWidgets.QDialog):
         super().accept()
 
 
-# -------------------- Sweep widget (tab) --------------------
+# -------------------- Sweep tab widget --------------------
 class SweepWidget(QtWidgets.QWidget):
     """
-    Tab for wavelength sweep with laser + CoreDAQ.
+    Sweep-with-laser tab.
 
-    - Shows one card per active channel (physical + math + relative).
-    - Uses ChannelManager to know which channels exist.
-    - Uses CoreDAQ + TSL laser in a QThread backend.
+    Uses:
+      - ChannelManager for which channels to plot/save
+      - Shared CoreDAQ instance passed from main
+      - Laser model selection + sweep params
     """
 
-    def __init__(self, manager: ChannelManager, parent=None):
+    sweep_started = QtCore.pyqtSignal()
+    sweep_finished = QtCore.pyqtSignal()
+
+    def __init__(self, manager: ChannelManager, daq, parent=None):
         super().__init__(parent)
         self.manager = manager
+        self.daq = daq
 
-        # current sweep params (no DAQ port here; it's auto-detected before each sweep)
+        self.setObjectName("SweepContainer")
+
         self.params: Dict[str, Any] = {
             "start_nm": DEFAULT_START_NM,
             "stop_nm": DEFAULT_STOP_NM,
@@ -321,30 +296,156 @@ class SweepWidget(QtWidgets.QWidget):
             "speed_nm_s": DEFAULT_SPEED_NM_S,
             "sample_rate": DEFAULT_SAMPLE_RATE,
             "gpib_addr": DEFAULT_GPIB_ADDR,
-            "laser_model": LASER_MODELS[0],  # default: TSL 770
-            # "daq_port" will be injected in run_sweep()
+            "laser_model": DEFAULT_LASER_MODEL,
+            "gain_ch1": 0,
+            "gain_ch2": 0,
+            "gain_ch3": 0,
+            "gain_ch4": 0,
         }
 
         self.thread: Optional[QtCore.QThread] = None
         self.worker: Optional[SweepWorker] = None
         self.save_path: Optional[str] = None
 
-        # cards: list of dicts {entry, frame, curve, value_label, plot}
-        self._cards: List[Dict[str, Any]] = []
+        self.cards: List[Dict[str, Any]] = []
+        self.gain_combos: List[QtWidgets.QComboBox] = []
+
+        # Pre-fetch gain labels if available
+        try:
+            self.gain_labels = list(getattr(CoreDAQ, "GAIN_LABELS", []))
+        except Exception:
+            self.gain_labels = []
 
         self._build_ui()
-        self._update_summary()
         self.on_channels_updated()
+        self._update_summary()
 
-    # ---------------- UI building ----------------
+    # ------------------------------------------------------------------
+    # Public API called from main
+    # ------------------------------------------------------------------
+    def set_daq(self, daq):
+        self.daq = daq
+        # Sync gain combos from device once, without autogain
+        if self.daq is None or not self.gain_combos:
+            return
+        try:
+            g1, g2, g3, g4 = self.daq.get_gains()
+            gains = [int(g1), int(g2), int(g3), int(g4)]
+            for i, g in enumerate(gains):
+                if 0 <= g < self.gain_combos[i].count():
+                    self.gain_combos[i].blockSignals(True)
+                    self.gain_combos[i].setCurrentIndex(g)
+                    self.gain_combos[i].blockSignals(False)
+                    self.params[f"gain_ch{i+1}"] = g
+        except Exception:
+            pass
 
+    def open_params_dialog(self, parent):
+        dlg = SweepParamsDialog(self.params, parent)
+        if dlg.exec_() == QtWidgets.QDialog.Accepted:
+            self.params = dlg.params()
+            self._update_summary()
+
+    def on_channels_updated(self):
+        while self.grid.count():
+            item = self.grid.takeAt(0)
+            w = item.widget()
+            if w is not None:
+                w.deleteLater()
+        self.cards.clear()
+
+        display_channels = self.manager.get_display_channels()
+        if not display_channels:
+            return
+
+        axis_font = QtGui.QFont()
+        axis_font.setPointSize(8)
+
+        colors = [
+            "#00E5FF",
+            "#FF4081",
+            "#FFD740",
+            "#69F0AE",
+            "#7C4DFF",
+            "#FF6E40",
+            "#64FFDA",
+            "#FFEB3B",
+        ]
+
+        for idx, cfg in enumerate(display_channels):
+            row = idx // 2
+            col = idx % 2
+
+            frame = QtWidgets.QFrame(self.inner)
+            frame.setObjectName("SweepChannelCard")
+            frame_layout = QtWidgets.QVBoxLayout(frame)
+            frame_layout.setContentsMargins(10, 8, 10, 10)
+            frame_layout.setSpacing(4)
+
+            header = QtWidgets.QHBoxLayout()
+            header.setContentsMargins(0, 0, 0, 0)
+            header.setSpacing(6)
+
+            name_label = QtWidgets.QLabel(cfg.name)
+            name_font = name_label.font()
+            name_font.setPointSize(int(name_font.pointSize() * 1.2))
+            name_font.setBold(True)
+            name_label.setFont(name_font)
+            name_label.setStyleSheet("color: #ffffff;")
+            header.addWidget(name_label)
+            header.addStretch(1)
+
+            frame_layout.addLayout(header)
+
+            pw = pg.PlotWidget(background="k")
+            pw.setMenuEnabled(False)
+            pw.showGrid(x=True, y=True, alpha=0.2)
+            pw.setLabel("bottom", "Wavelength", units="nm")
+            if cfg.kind == "relative":
+                pw.setLabel("left", cfg.name, units="dB")
+            else:
+                pw.setLabel("left", cfg.name, units="W")
+
+            left_axis = pw.getAxis("left")
+            bottom_axis = pw.getAxis("bottom")
+            left_axis.setStyle(tickFont=axis_font)
+            bottom_axis.setStyle(tickFont=axis_font)
+            left_axis.setPen(pg.mkPen("#bbbbbb"))
+            bottom_axis.setPen(pg.mkPen("#bbbbbb"))
+
+            color = colors[idx % len(colors)]
+            curve = pw.plot(
+                pen=pg.mkPen(color, width=2),
+                clipToView=True,
+            )
+
+            frame_layout.addWidget(pw, 1)
+            self.grid.addWidget(frame, row, col)
+
+            self.cards.append(
+                {
+                    "cfg": cfg,
+                    "frame": frame,
+                    "plot": pw,
+                    "curve": curve,
+                }
+            )
+
+        self.grid.setRowStretch((len(display_channels) + 1) // 2 + 1, 1)
+
+    # ------------------------------------------------------------------
+    # UI build
+    # ------------------------------------------------------------------
     def _build_ui(self):
-        layout = QtWidgets.QVBoxLayout(self)
-        layout.setContentsMargins(8, 8, 8, 8)
-        layout.setSpacing(6)
+        outer = QtWidgets.QVBoxLayout(self)
+        outer.setContentsMargins(8, 8, 8, 8)
+        outer.setSpacing(6)
 
-        # Summary row: label + Run button
+        # --- summary + run ---
         top_row = QtWidgets.QHBoxLayout()
+        top_row.setContentsMargins(0, 0, 0, 0)
+        top_row.setSpacing(8)
+
         self.lbl_summary = QtWidgets.QLabel()
         self.lbl_summary.setWordWrap(True)
         top_row.addWidget(self.lbl_summary, 1)
@@ -353,165 +454,82 @@ class SweepWidget(QtWidgets.QWidget):
         self.btn_run.clicked.connect(self.run_sweep)
         top_row.addWidget(self.btn_run, 0, alignment=QtCore.Qt.AlignRight)
 
-        layout.addLayout(top_row)
+        outer.addLayout(top_row)
 
-        # Scroll area with channel cards
-        self.scroll = QtWidgets.QScrollArea()
+        # --- Gain row (manual gains only) ---
+        gain_row = QtWidgets.QHBoxLayout()
+        gain_row.setContentsMargins(0, 0, 0, 0)
+        gain_row.setSpacing(10)
+
+        self.gain_combos = []
+
+        for head in range(1, 5):
+            group = QtWidgets.QHBoxLayout()
+            group.setSpacing(4)
+
+            lbl = QtWidgets.QLabel(f"Gain CH{head}")
+            lbl.setStyleSheet("color: #ffffff;")
+            group.addWidget(lbl)
+
+            combo = QtWidgets.QComboBox()
+            combo.setMinimumWidth(70)
+
+            for g in range(8):
+                if self.gain_labels and g < len(self.gain_labels):
+                    text = self.gain_labels[g]
+                else:
+                    text = f"G{g}"
+                combo.addItem(text, g)
+            combo.setCurrentIndex(0)
+
+            combo.currentIndexChanged[int].connect(
+                lambda value, h=head: self._on_gain_changed(h, value)
+            )
+
+            group.addWidget(combo)
+            gain_row.addLayout(group)
+
+            self.gain_combos.append(combo)
+
+        gain_row.addStretch(1)
+        outer.addLayout(gain_row)
+
+        # --- plots area ---
+        self.scroll = QtWidgets.QScrollArea(self)
         self.scroll.setWidgetResizable(True)
-        self.scroll.setFrameShape(QtWidgets.QFrame.NoFrame)
+        self.scroll.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarAlwaysOff)
+        outer.addWidget(self.scroll, 1)
 
-        self.scroll_inner = QtWidgets.QWidget()
-        self.scroll.setWidget(self.scroll_inner)
+        self.inner = QtWidgets.QWidget()
+        self.scroll.setWidget(self.inner)
 
-        self.grid = QtWidgets.QGridLayout(self.scroll_inner)
-        self.grid.setContentsMargins(0, 0, 0, 0)
-        self.grid.setSpacing(10)
+        self.grid = QtWidgets.QGridLayout(self.inner)
+        self.grid.setContentsMargins(12, 12, 12, 12)
+        self.grid.setSpacing(12)
 
-        layout.addWidget(self.scroll, 1)
-
-        # Log at the bottom
+        # --- log ---
         self.txt_log = QtWidgets.QPlainTextEdit()
         self.txt_log.setReadOnly(True)
         self.txt_log.setMaximumHeight(140)
-        layout.addWidget(self.txt_log)
+        outer.addWidget(self.txt_log)
 
-    # ---------------- Channel cards ----------------
-
-    def on_channels_updated(self):
-        """Called by MainWindow when channel config changes (View / Channels menu)."""
-        self._rebuild_cards()
-
-    def _collect_channel_entries(self) -> List[Dict[str, Any]]:
-        """
-        Build a list of logical channels (physical + math + relative)
-        to be displayed as cards.
-        Each entry is a dict describing how to compute that channel.
-        """
-        entries: List[Dict[str, Any]] = []
-
-        # Physical channels (CH1..CH4), only if enabled in ChannelManager
-        for idx in range(4):
-            if self.manager.is_physical_enabled(idx):
-                entries.append(
-                    {
-                        "kind": "physical",
-                        "name": f"Channel {idx + 1}",
-                        "unit": "W",
-                        "phys_index": idx,
-                    }
-                )
-
-        # Math channels from manager
-        for cfg in self.manager.math_channels:
-            entries.append(
-                {
-                    "kind": "math",
-                    "name": cfg.name,
-                    "unit": getattr(cfg, "unit", "W"),
-                    "config": cfg,
-                }
-            )
-
-        # Relative transmission channels
-        for cfg in self.manager.relative_channels:
-            entries.append(
-                {
-                    "kind": "relative",
-                    "name": cfg.name,
-                    "unit": getattr(cfg, "unit", "dB"),
-                    "config": cfg,
-                }
-            )
-
-        return entries
-
-    def _clear_cards(self):
-        while self.grid.count():
-            item = self.grid.takeAt(0)
-            w = item.widget()
-            if w is not None:
-                w.deleteLater()
-        self._cards.clear()
-
-    def _rebuild_cards(self):
-        self._clear_cards()
-
-        entries = self._collect_channel_entries()
-        if not entries:
+    # ------------------------------------------------------------------
+    # Gain handling
+    # ------------------------------------------------------------------
+    def _on_gain_changed(self, head: int, value: int):
+        """User changed gain for a head; apply immediately, no autogain."""
+        self.params[f"gain_ch{head}"] = int(value)
+        if self.daq is None:
             return
+        try:
+            self.daq.set_gain(head, int(value))
+            self.log(f"Set gain CH{head} = {value}")
+        except Exception as e:
+            self.log(f"Failed to set gain CH{head}: {e}")
 
-        colors = ["#00E5FF", "#FF4081", "#FFD740", "#69F0AE", "#B388FF", "#FFAB91"]
-
-        axis_font = QtGui.QFont()
-        axis_font.setPointSize(9)
-
-        cols = 2
-        row = 0
-        col = 0
-
-        for idx, entry in enumerate(entries):
-            frame = QtWidgets.QFrame()
-            frame.setObjectName("SweepChannelCard")
-            v = QtWidgets.QVBoxLayout(frame)
-            v.setContentsMargins(10, 8, 10, 8)
-            v.setSpacing(6)
-
-            # Header row
-            header = QtWidgets.QHBoxLayout()
-            lbl_name = QtWidgets.QLabel(entry["name"])
-            name_font = lbl_name.font()
-            name_font.setPointSize(int(name_font.pointSize() * 1.3))
-            name_font.setBold(True)
-            lbl_name.setFont(name_font)
-            header.addWidget(lbl_name, 0, QtCore.Qt.AlignLeft | QtCore.Qt.AlignVCenter)
-
-            lbl_value = QtWidgets.QLabel("—")
-            val_font = lbl_value.font()
-            val_font.setPointSize(int(val_font.pointSize() * 1.1))
-            lbl_value.setFont(val_font)
-            header.addWidget(lbl_value, 0, QtCore.Qt.AlignRight | QtCore.Qt.AlignVCenter)
-
-            v.addLayout(header)
-
-            # Plot
-            pw = pg.PlotWidget(background="k")
-            pw.setMenuEnabled(False)
-            pw.showGrid(x=True, y=True, alpha=0.25)
-            pw.setLabel("bottom", "Wavelength", units="nm")
-            pw.setLabel("left", entry["unit"])
-            pw.getAxis("left").setStyle(tickFont=axis_font)
-            pw.getAxis("bottom").setStyle(tickFont=axis_font)
-
-            color = colors[idx % len(colors)]
-            curve = pw.plot(pen=pg.mkPen(color, width=2), clipToView=True)
-            try:
-                curve.setDownsampling(auto=True, method="peak")
-            except Exception:
-                pass
-
-            v.addWidget(pw, 1)
-
-            self.grid.addWidget(frame, row, col)
-            col += 1
-            if col >= cols:
-                col = 0
-                row += 1
-
-            self._cards.append(
-                {
-                    "entry": entry,
-                    "frame": frame,
-                    "plot": pw,
-                    "curve": curve,
-                    "value_label": lbl_value,
-                }
-            )
-
-        # Stretch last row
-        self.grid.setRowStretch(row + 1, 1)
-
-    # ---------------- Summary ----------------
-
+    # ------------------------------------------------------------------
+    # Summary text
+    # ------------------------------------------------------------------
     def _update_summary(self):
         p = self.params
         sweep_span = abs(p["stop_nm"] - p["start_nm"])
@@ -526,23 +544,16 @@ class SweepWidget(QtWidgets.QWidget):
             f"Sweep: {p['start_nm']:.1f} nm → {p['stop_nm']:.1f} nm at "
             f"{p['speed_nm_s']:.1f} nm/s  |  "
             f"Power: {p['power_mw']:.1f} mW\n"
-            f"Sample rate: {p['sample_rate'] / 1000:.1f} kHz, "
+            f"DAQ: {p['sample_rate'] / 1000:.1f} kHz, "
             f"Samples (est): {samples_est} "
             f"(~{sweep_duration:.2f} s)  |  "
             f"Laser: {p['laser_model']}  |  GPIB: {p['gpib_addr']}"
         )
         self.lbl_summary.setText(txt)
 
-    # ---------------- Menubar hook ----------------
-
-    def open_params_dialog(self, parent: QtWidgets.QWidget):
-        dlg = SweepParamsDialog(self.params, parent)
-        if dlg.exec_() == QtWidgets.QDialog.Accepted:
-            self.params = dlg.params()
-            self._update_summary()
-
-    # ---------------- Logging ----------------
-
+    # ------------------------------------------------------------------
+    # Logging
+    # ------------------------------------------------------------------
     def log(self, msg: str):
         t = time.strftime("%H:%M:%S")
         self.txt_log.appendPlainText(f"[{t}] {msg}")
@@ -550,27 +561,21 @@ class SweepWidget(QtWidgets.QWidget):
             self.txt_log.verticalScrollBar().maximum()
         )
 
-    # ---------------- Sweep control ----------------
-
-    def _auto_detect_daq_port(self) -> str:
-        """
-        Try to auto-detect CoreDAQ via CoreDAQ.find().
-        Fallback to DEFAULT_DAQ_PORT if detection fails.
-        """
-        try:
-            ports = CoreDAQ.find()
-            if ports:
-                return ports[0]
-        except Exception:
-            pass
-        return DEFAULT_DAQ_PORT
-
+    # ------------------------------------------------------------------
+    # Sweep control
+    # ------------------------------------------------------------------
     def run_sweep(self):
         if self.thread is not None:
             self.log("Sweep already running.")
             return
+        if self.daq is None:
+            QtWidgets.QMessageBox.warning(
+                self,
+                "CoreDAQ not connected",
+                "No CoreDAQ device is connected. Connect in the main window first.",
+            )
+            return
 
-        # Ask for CSV path *before* starting sweep
         default_name = time.strftime("coredaq_sweep_%Y%m%d_%H%M%S.csv")
         path, _ = QtWidgets.QFileDialog.getSaveFileName(
             self,
@@ -584,21 +589,29 @@ class SweepWidget(QtWidgets.QWidget):
 
         self.save_path = path
 
-        # Inject DAQ port automatically (no UI for this)
-        daq_port = self._auto_detect_daq_port()
-        self.params["daq_port"] = daq_port
-        self.log(f"Using CoreDAQ port: {daq_port}")
+        # Take gains from comboboxes (manual only)
+        for head in range(1, 5):
+            if 0 <= head - 1 < len(self.gain_combos):
+                combo = self.gain_combos[head - 1]
+                g = combo.currentData()
+                if g is None:
+                    g = combo.currentIndex()
+            else:
+                g = 0
+            self.params[f"gain_ch{head}"] = int(g)
 
+        self._update_summary()
         self.btn_run.setEnabled(False)
 
-        # Clear plots
-        for card in self._cards:
+        for card in self.cards:
             card["curve"].setData([], [])
 
         self.log(f"Starting sweep… (saving to {self.save_path})")
 
+        self.sweep_started.emit()
+
         self.thread = QtCore.QThread(self)
-        self.worker = SweepWorker(self.params)
+        self.worker = SweepWorker(self.params, self.daq)
         self.worker.moveToThread(self.thread)
 
         self.thread.started.connect(self.worker.run)
@@ -617,19 +630,15 @@ class SweepWidget(QtWidgets.QWidget):
             self.worker = None
         self.btn_run.setEnabled(True)
         self.log("Sweep thread finished.")
+        self.sweep_finished.emit()
 
     def _on_error(self, msg: str):
         self.log(f"ERROR: {msg}")
         QtWidgets.QMessageBox.critical(self, "Sweep Error", msg)
 
-    def _on_result(self, wavelengths, channels_W, env):
-        """
-        wavelengths: (N,),
-        channels_W: list of 4 arrays (N,) in W for physical CH1..CH4
-        env: dict with die/head temperature and humidity
-        """
-        wavelengths = np.asarray(wavelengths, dtype=float)
-        if len(wavelengths) == 0:
+    def _on_result(self, wavelengths, channels_W):
+        wavelengths = np.asarray(wavelengths)
+        if wavelengths.size == 0:
             self.log("No data returned from sweep.")
             return
 
@@ -637,155 +646,81 @@ class SweepWidget(QtWidgets.QWidget):
             self.log("Channel data not in expected list/tuple form.")
             return
 
-        # Normalize physical data list length to 4
-        if len(channels_W) < 4:
-            channels_W = list(channels_W) + [
-                np.zeros_like(wavelengths)
-            ] * (4 - len(channels_W))
-        elif len(channels_W) > 4:
-            channels_W = channels_W[:4]
-
-        phys = [np.asarray(channels_W[i], dtype=float) for i in range(4)]
-        phys = [np.resize(ch, wavelengths.shape) for ch in phys]
-
-        # For saving CSV: only enabled channels => the ones that have cards
-        cols_data: List[np.ndarray] = [wavelengths]
-        col_labels: List[str] = ["wavelength_nm"]
-
-        # Compute data for each displayed channel entry
-        for card in self._cards:
-            entry = card["entry"]
-            kind = entry["kind"]
-
-            if kind == "physical":
-                idx = entry["phys_index"]
-                ys = phys[idx]
-
-            elif kind == "math":
-                cfg = entry["config"]
-                expr = getattr(cfg, "expression", "")
-                env_vars = {
-                    "ch1": phys[0],
-                    "ch2": phys[1],
-                    "ch3": phys[2],
-                    "ch4": phys[3],
-                }
-                try:
-                    ys = np.asarray(safe_eval_expression(expr, env_vars), dtype=float)
-                except Exception as e:
-                    self.log(f"Math channel '{cfg.name}' error: {e}")
-                    ys = np.zeros_like(wavelengths)
-
-            elif kind == "relative":
-                cfg = entry["config"]
-                num_idx, den_idx = getattr(cfg, "rel_src_indices", (0, 1))
-                num = phys[num_idx]
-                den = phys[den_idx]
-                ratio = np.divide(
-                    num,
-                    np.clip(den, 1e-15, None),
-                    out=np.zeros_like(num),
-                    where=den > 0,
-                )
-                ys = 10.0 * np.log10(np.clip(ratio, 1e-15, None))
-
+        phys_arrays: List[np.ndarray] = []
+        for i in range(4):
+            if i < len(channels_W):
+                ys = np.asarray(channels_W[i])
+                if ys.shape != wavelengths.shape:
+                    ys = np.resize(ys, wavelengths.shape)
             else:
                 ys = np.zeros_like(wavelengths)
+            phys_arrays.append(ys)
 
-            ys = np.resize(ys, wavelengths.shape)
+        display_channels = self.manager.get_display_channels()
+        channel_arrays: List[np.ndarray] = []
 
-            curve = card["curve"]
-            pw = card["plot"]
-            val_label = card["value_label"]
-            unit = entry["unit"]
-
-            curve.setData(wavelengths, ys)
-
-            # Autoscale Y with 30% padding
-            ymin = float(np.nanmin(ys))
-            ymax = float(np.nanmax(ys))
-            if np.isfinite(ymin) and np.isfinite(ymax):
-                span = ymax - ymin
-                if span <= 0:
-                    span = max(1e-9, abs(ymax) * 0.2)
-
-                pad = 0.3 * span
-                lo = ymin - pad
-                hi = ymax + pad
-                if hi <= lo:
-                    hi = lo + span if span > 0 else lo + 1e-3
-
-                pw.setYRange(lo, hi, padding=0)
-
-            pw.setXRange(float(wavelengths.min()), float(wavelengths.max()), padding=0)
-
-            # Update value label with last point
-            last = ys[-1]
-            if unit.lower() in ("w", "watt", "watts"):
-                abs_val = abs(last)
-                if abs_val >= 1e-3:
-                    val_label.setText(f"{last * 1e3:.3f} mW")
-                elif abs_val >= 1e-6:
-                    val_label.setText(f"{last * 1e6:.3f} µW")
-                elif abs_val >= 1e-9:
-                    val_label.setText(f"{last * 1e9:.3f} nW")
+        for cfg in display_channels:
+            if cfg.kind == "physical":
+                idx = cfg.index or 0
+                if 0 <= idx < 4:
+                    arr = phys_arrays[idx]
                 else:
-                    val_label.setText(f"{last:.3e} W")
-            elif unit.lower() == "db":
-                val_label.setText(f"{last:.2f} dB")
+                    arr = np.zeros_like(wavelengths)
+            elif cfg.kind == "math":
+                try:
+                    arr = self.manager.eval_math_array(cfg, phys_arrays)
+                except Exception:
+                    arr = np.zeros_like(wavelengths)
+            elif cfg.kind == "relative":
+                try:
+                    arr = self.manager.eval_relative_array(cfg, phys_arrays)
+                except Exception:
+                    arr = np.full_like(wavelengths, np.nan)
             else:
-                val_label.setText(f"{last:.3f} {unit}")
+                arr = np.zeros_like(wavelengths)
 
-            # ----- add to CSV columns -----
-            cols_data.append(ys)
-            if unit:
-                col_labels.append(f"{entry['name']} ({unit})")
-            else:
-                col_labels.append(entry["name"])
+            arr = np.asarray(arr)
+            if arr.shape != wavelengths.shape:
+                arr = np.resize(arr, wavelengths.shape)
+            channel_arrays.append(arr)
+
+        for card, arr in zip(self.cards, channel_arrays):
+            cfg: ChannelConfig = card["cfg"]
+            curve = card["curve"]
+            plot = card["plot"]
+
+            curve.setData(wavelengths, arr)
+
+            ymin = float(np.nanmin(arr))
+            ymax = float(np.nanmax(arr))
+            if not np.isfinite(ymin) or not np.isfinite(ymax):
+                continue
+
+            span = ymax - ymin
+            if span <= 0:
+                span = max(1e-9, abs(ymax) * 0.2)
+            pad = 0.3 * span
+            lo = ymin - pad
+            hi = ymax + pad
+
+            if cfg.kind != "relative":
+                lo = max(0.0, lo)
+
+            if hi <= lo:
+                hi = lo + span if span > 0 else lo + 1e-3
+
+            plot.setYRange(lo, hi, padding=0)
+            plot.setXRange(float(wavelengths.min()), float(wavelengths.max()), padding=0)
 
         self.log(
             f"Sweep result: λ in [{wavelengths.min():.1f}, {wavelengths.max():.1f}] nm"
         )
 
-        # -------- Save CSV if path was selected --------
         if self.save_path is not None:
             try:
-                data = np.column_stack(cols_data)
-                column_header_line = ",".join(col_labels)
-
-                # Metadata comments
-                p = self.params
-                die_temp = env.get("die_temp_C", None) if isinstance(env, dict) else None
-                head_temp = env.get("head_temp_C", None) if isinstance(env, dict) else None
-                humidity = env.get("humidity_RH", None) if isinstance(env, dict) else None
-
-                meta_lines = [
-                    "CoreDAQ wavelength sweep",
-                    f"Timestamp: {time.strftime('%Y-%m-%d %H:%M:%S')}",
-                    f"Laser model: {p['laser_model']}",
-                    f"Start wavelength (nm): {p['start_nm']}",
-                    f"Stop wavelength (nm): {p['stop_nm']}",
-                    f"Sweep speed (nm/s): {p['speed_nm_s']}",
-                    f"Laser power (mW): {p['power_mw']}",
-                    f"Sample rate (Hz): {p['sample_rate']}",
-                ]
-
-                if die_temp is not None:
-                    meta_lines.append(f"Device temperature (die) [°C]: {die_temp:.2f}")
-                if head_temp is not None:
-                    meta_lines.append(f"Frontend temperature [°C]: {head_temp:.2f}")
-                if humidity is not None:
-                    meta_lines.append(f"Humidity [%RH]: {humidity:.2f}")
-
-                # Write all by hand so we get:
-                #   # meta ...
-                #   wavelength_nm,...
-                with open(self.save_path, "w") as f:
-                    for line in meta_lines:
-                        f.write(f"# {line}\n")
-                    f.write(column_header_line + "\n")
-                    np.savetxt(f, data, delimiter=",", comments="")
-
+                self._save_csv_with_metadata(
+                    self.save_path, wavelengths, display_channels, channel_arrays
+                )
                 self.log(f"Saved CSV to: {self.save_path}")
             except Exception as e:
                 self.log(f"ERROR saving CSV: {e}")
@@ -796,3 +731,73 @@ class SweepWidget(QtWidgets.QWidget):
                 )
             finally:
                 self.save_path = None
+
+    # ------------------------------------------------------------------
+    # CSV saving with metadata
+    # ------------------------------------------------------------------
+    def _save_csv_with_metadata(
+        self,
+        path: str,
+        wavelengths: np.ndarray,
+        display_channels: List[ChannelConfig],
+        channel_arrays: List[np.ndarray],
+    ):
+        p = self.params
+
+        board_T = None
+        board_H = None
+        die_T = None
+
+        if self.daq is not None:
+            try:
+                board_T = float(self.daq.get_head_temperature_C())
+            except Exception:
+                board_T = None
+            try:
+                board_H = float(self.daq.get_head_humidity())
+            except Exception:
+                board_H = None
+            try:
+                die_T = float(self.daq.get_die_temperature_C())
+            except Exception:
+                die_T = None
+
+        meta_lines = [
+            f"laser_model={p.get('laser_model', DEFAULT_LASER_MODEL)}",
+            f"start_nm={p.get('start_nm', DEFAULT_START_NM)}",
+            f"stop_nm={p.get('stop_nm', DEFAULT_STOP_NM)}",
+            f"power_mW={p.get('power_mw', DEFAULT_POWER_MW)}",
+            f"speed_nm_per_s={p.get('speed_nm_s', DEFAULT_SPEED_NM_S)}",
+            f"sample_rate_Hz={p.get('sample_rate', DEFAULT_SAMPLE_RATE)}",
+            f"gpib_addr={p.get('gpib_addr', DEFAULT_GPIB_ADDR)}",
+        ]
+
+        if board_T is not None:
+            meta_lines.append(f"board_temperature_C={board_T:.2f}")
+        if board_H is not None:
+            meta_lines.append(f"humidity_percent={board_H:.2f}")
+        if die_T is not None:
+            meta_lines.append(f"die_temperature_C={die_T:.2f}")
+
+        col_names = ["wavelength_nm"]
+        for cfg in display_channels:
+            unit = cfg.unit or ("dB" if cfg.kind == "relative" else "W")
+            safe_name = cfg.name.replace(",", "_").replace(" ", "_")
+            col_names.append(f"{safe_name}_{unit}")
+
+        header_data = ",".join(col_names)
+
+        cols = [np.asarray(wavelengths)]
+        for arr in channel_arrays:
+            cols.append(np.asarray(arr))
+        data = np.column_stack(cols)
+
+        full_header = "\n".join(meta_lines + [header_data])
+
+        np.savetxt(
+            path,
+            data,
+            delimiter=",",
+            header=full_header,
+            comments="# ",
+        )
